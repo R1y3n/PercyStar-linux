@@ -3780,8 +3780,8 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
         st.lock().unwrap().header_info = hdr_info.clone();
     }
 
-    // <=512mb: one sequential read serves both passes (was read twice, painful over smb)
-    let whole: Option<Vec<u8>> = if sz <= 512 * 1024 * 1024 {
+    // <=256mb: one sequential read serves both passes; larger files stream to cut peak memory
+    let whole: Option<Vec<u8>> = if sz <= 256 * 1024 * 1024 {
         f.seek(SeekFrom::Start(0))?;
         let mut d = Vec::with_capacity(sz as usize);
         f.read_to_end(&mut d)?;
@@ -4001,6 +4001,7 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
         enrich_audio_rpf_entries(path, sz, &mut found);
     }
 
+    found.shrink_to_fit();
     Ok((hdr_info, found))
 }
 

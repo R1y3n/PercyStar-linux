@@ -1553,7 +1553,7 @@ fn blend_preview_pixel(dst: &mut Color32, src: Color32, alpha: u8) {
 
 fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
     let npix = w * h;
-    if mesh.fb_w != w || mesh.fb_h != h {
+    if mesh.fb_w != w || mesh.fb_h != h || mesh.color_buf.len() != npix || mesh.z_buf.len() != npix {
         mesh.fb_w = w;
         mesh.fb_h = h;
         mesh.color_buf.resize(npix, Color32::from_rgb(13, 14, 18));
@@ -2176,6 +2176,14 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
             mesh.tex = Some(ui.ctx().load_texture("percystar_3d_fb", ci, TextureOptions::LINEAR));
         }
         mesh.dirty = false;
+    }
+    if !mesh.dirty && !mesh.auto_spin {
+        mesh.color_buf = Vec::new();
+        mesh.z_buf = Vec::new();
+        mesh.proj_buf.clear();
+        mesh.proj_buf.shrink_to_fit();
+        mesh.blend_order.clear();
+        mesh.blend_order.shrink_to_fit();
     }
 
     let p = ui.painter_at(rect);
