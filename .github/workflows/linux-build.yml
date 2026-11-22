@@ -86,20 +86,24 @@ jobs:
           cp AppDir/usr/share/applications/percystar.desktop AppDir/percystar.desktop
 
           wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage -O linuxdeploy.AppImage
-          wget -q https://github.com/linuxdeploy/linuxdeploy-plugin-gtk/releases/download/continuous/linuxdeploy-plugin-gtk-x86_64.AppImage -O linuxdeploy-plugin-gtk.AppImage
-          chmod +x linuxdeploy.AppImage linuxdeploy-plugin-gtk.AppImage
+          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool.AppImage
+          chmod +x linuxdeploy.AppImage appimagetool.AppImage
           export PATH="$PWD:$PATH"
-          export DEPLOY_GTK_VERSION=3
           file AppDir/usr/bin/PercyStar || true
           ldd AppDir/usr/bin/PercyStar | tail -30 || true
-          ./linuxdeploy.AppImage --appdir AppDir --executable AppDir/usr/bin/PercyStar --desktop-file AppDir/usr/share/applications/percystar.desktop --icon-file AppDir/usr/share/icons/hicolor/256x256/apps/percystar.png --plugin gtk --output appimage 2>&1 | tee linuxdeploy.log; rc=${PIPESTATUS[0]}
+          ./linuxdeploy.AppImage --appdir AppDir --executable AppDir/usr/bin/PercyStar --desktop-file AppDir/usr/share/applications/percystar.desktop --icon-file AppDir/usr/share/icons/hicolor/256x256/apps/percystar.png 2>&1 | tee linuxdeploy.log; rc=${PIPESTATUS[0]}
           if [ $rc -ne 0 ]; then
             echo "--- linuxdeploy failed rc=$rc ---"
             tail -120 linuxdeploy.log || true
             exit $rc
           fi
-          ls -la PercyStar*.AppImage
-          mv PercyStar*.AppImage PercyStar-linux-x86_64.AppImage
+          ARCH=x86_64 ./appimagetool.AppImage AppDir PercyStar-linux-x86_64.AppImage 2>&1 | tee appimagetool.log; rc=${PIPESTATUS[0]}
+          if [ $rc -ne 0 ]; then
+            echo "--- appimagetool failed rc=$rc ---"
+            tail -120 appimagetool.log || true
+            exit $rc
+          fi
+          ls -la PercyStar-linux-x86_64.AppImage
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
