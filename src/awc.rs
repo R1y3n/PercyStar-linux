@@ -392,7 +392,8 @@ fn decode_opus_chunk_into(
         return Err(notes);
     }
 
-    let ch: usize = if (packets[0][0] & 0x04) != 0 { 2 } else { 1 };
+    let toc = packets.iter().max_by_key(|p| p.len()).map(|p| p[0]).unwrap_or(packets[0][0]);
+    let ch: usize = if (toc & 0x04) != 0 { 2 } else { 1 };
     let mut dec = OpusDecoder::new(48_000, ch)
         .map_err(|err| vec![format!("Chunk #{idx} (ch={ch}): OpusDecoder::new(48000, {ch}) failed: {err:?}")])?;
     if pcm_f32.len() < 5760 * ch {

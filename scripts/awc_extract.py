@@ -60,18 +60,20 @@ def probe_superblock_streams(blob: bytes):
     return n if (n >= 1 and total_blks <= 255) else None
 
 
-def collect_2kb_packets(blob: bytes, packets: list[bytes]) -> None:
+def collect_2kb_packets(blob: bytes | memoryview, packets: list[bytes]) -> None:
     # rage opus streams split into 2048 byte blocks of u16 prefixed frames;
     # a 320-byte frame leaves room for ~6 more in the same block, so this
     # has to walk every packet in the block, not just the first
-    for bpos in range(0, len(blob), 2048):
-        blk = blob[bpos : bpos + 2048]
-        p = 0
-        while p + 2 <= len(blk):
-            plen = struct.unpack_from("<H", blk, p)[0]
-            if plen == 0 or p + 2 + plen > len(blk):
+    mv = memoryview(blob)
+    n = len(mv)
+    for bpos in range(0, n, 2048):
+        bend = min(bpos + 2048, n)
+        p = bpos
+        while p + 2 <= bend:
+            plen = struct.unpack_from("<H", mv, p)[0]
+            if plen == 0 or p + 2 + plen > bend:
                 break
-            packets.append(blk[p + 2 : p + 2 + plen])
+            packets.append(bytes(mv[p + 2 : p + 2 + plen]))
             p += 2 + plen
 
 
