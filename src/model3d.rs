@@ -87,6 +87,28 @@ pub struct TexLayer {
 pub struct ElsPoint {
     pub position: [f32; 3],
     pub bank: bool,
+    pub slot: u8,
+}
+
+// Decoded from the RAGE 9 Sirens PSO preset (id 3) in data.rpf. As in GTA V,
+// each light consumes one bit per beat, most-significant bit first. GTA VI keeps
+// the 32-step sequencers but stores the carcols-style data in hashed PSO fields.
+const RAGE9_SIREN_BPM: f64 = 500.0;
+const RAGE9_SIREN_MULTIPLES: u64 = 3;
+const RAGE9_SIREN_SEQUENCERS: [u32; 20] = [
+    0xAAAA_AAAA, 0xAA00_AA80, 0x5500_5500, 0x5555_5555,
+    0xAA5A_A954, 0x5555_554A, 0x5555_554A, 0xAA5A_A954,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+fn rage9_siren_lit(slot: u8, phase: u64) -> bool {
+    let Some(&sequencer) = slot.checked_sub(1).and_then(|i| RAGE9_SIREN_SEQUENCERS.get(i as usize)) else {
+        return false;
+    };
+    let subdivisions = RAGE9_SIREN_MULTIPLES * 2;
+    let beat = (phase / subdivisions) % 32;
+    let pulse = phase % subdivisions;
+    sequencer & (1 << (31 - beat)) != 0 && pulse % 2 == 0
 }
 
 impl GeomMaterial {
@@ -145,7 +167,7 @@ pub struct Mesh3D {
     pub els_enabled: bool,
     pub els_flash: bool,
     pub els_points: Vec<ElsPoint>,
-    els_flash_on: bool,
+    els_flash_phase: u64,
     pub tex_status: String,
     pub center: [f32; 3],
     pub radius: f32,
@@ -329,7 +351,7 @@ impl Mesh3D {
             els_enabled: false,
             els_flash: true,
             els_points: Vec::new(),
-            els_flash_on: true,
+            els_flash_phase: 0,
             tex_status,
             center,
             radius,
@@ -1464,7 +1486,11 @@ fn extract_rage9_siren_points(v: &[u8]) -> Vec<ElsPoint> {
             let lower = name.to_ascii_lowercase();
             let Some(siren_at) = lower.rfind("siren") else { continue };
             let Some(number) = lower[siren_at + "siren".len()..].parse::<u16>().ok() else { continue };
-            out.push(ElsPoint { position: world_pos[i], bank: number % 2 == 0 });
+            out.push(ElsPoint {
+                position: world_pos[i],
+                bank: number % 2 == 0,
+                slot: number.min(u8::MAX as u16) as u8,
+            });
         }
         if !out.is_empty() {
             return out;
@@ -2072,7 +2098,7 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
         let glow_radius = ((w.min(h) as f32) * 0.014).clamp(5.0, 18.0);
         let core_radius = (glow_radius * 0.28).max(2.0);
         for light in &mesh.els_points {
-            if mesh.els_flash && light.bank != mesh.els_flash_on {
+            if mesh.els_flash && !rage9_siren_lit(light.slot, mesh.els_flash_phase) {
                 continue;
             }
             let v = light.position;
@@ -2301,7 +2327,7 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
             }
             if ui
                 .add_enabled(mesh.els_enabled, egui::Checkbox::new(&mut mesh.els_flash, "Flash"))
-                .on_hover_text("Alternate the red/blue siren emitter banks.")
+                .on_hover_text("Use the game-authored 32-step siren sequencers at 500 BPM.")
                 .changed()
             {
                 mesh.dirty = true;
@@ -2363,14 +2389,15 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
         ui.ctx().request_repaint();
     }
     if mesh.els_enabled && mesh.els_flash {
-        let flash_on = ((ui.input(|i| i.time) * 7.0) as u64) % 2 == 0;
-        if flash_on != mesh.els_flash_on {
-            mesh.els_flash_on = flash_on;
+        let steps_per_second = RAGE9_SIREN_BPM / 60.0 * (RAGE9_SIREN_MULTIPLES * 2) as f64;
+        let phase = (ui.input(|i| i.time) * steps_per_second) as u64;
+        if phase != mesh.els_flash_phase {
+            mesh.els_flash_phase = phase;
             mesh.dirty = true;
         }
         ui.ctx().request_repaint();
-    } else if !mesh.els_flash_on {
-        mesh.els_flash_on = true;
+    } else if mesh.els_flash_phase != 0 {
+        mesh.els_flash_phase = 0;
         mesh.dirty = true;
     }
     if mesh.last_dragging && !dragging {
@@ -2426,6 +2453,23 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rage9_siren_uses_game_sequencers_and_sub_flashes() {
+        // siren1 starts with 1, siren4 with the inverse 0.
+        assert!(rage9_siren_lit(1, 0));
+        assert!(!rage9_siren_lit(4, 0));
+        // Three flashes are emitted inside an active beat.
+        assert!(!rage9_siren_lit(1, 1));
+        assert!(rage9_siren_lit(1, 2));
+        assert!(rage9_siren_lit(1, 4));
+        // The next bit reverses the pair; unused and invalid slots stay dark.
+        assert!(!rage9_siren_lit(1, 6));
+        assert!(rage9_siren_lit(4, 6));
+        assert!(!rage9_siren_lit(9, 0));
+        assert!(!rage9_siren_lit(0, 0));
+        assert!(!rage9_siren_lit(21, 0));
+    }
 
     #[test]
     fn upright_and_not_mirrored() {
