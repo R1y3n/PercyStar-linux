@@ -3790,6 +3790,7 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
         None
     };
     let mut found = Vec::new();
+    let mut claimed: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut off = 0u64;
     let mut buf = if whole.is_some() { Vec::new() } else { vec![0u8; 16 * 1024 * 1024] };
     let mut probe_dec = Decompress::new(true);
@@ -3826,20 +3827,32 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
         let mut jumped = false;
         while pos + 44 <= read_n {
             if let Some(entry) = probe_rage9_page(buf, pos, read_n, off, path, &rname, &mut probe_dec, &mut probe_out) {
+                claimed.insert(entry.offset);
+                let csz = entry.comp_size.max(0x1000);
                 found.push(entry);
-                pos += 0x1000;
-                continue;
+                let next_page = (off + pos as u64 + csz + 0xFFF) & !0xFFF;
+                if next_page > off + read_n as u64 {
+                    off = next_page;
+                    jumped = true;
+                    need_seek = true;
+                    break;
+                } else {
+                    pos = (next_page - off) as usize;
+                    continue;
+                }
             }
             let tag = &buf[pos..pos + 4];
             if tag == b"ADAT" {
                 awc_idx += 1;
                 let sc = u32::from_le_bytes([buf[pos + 8], buf[pos + 9], buf[pos + 10], buf[pos + 11]]);
+                let abs_off = off + pos as u64;
+                claimed.insert(abs_off);
                 found.push(RpfEntry {
                     source_rpf: path.clone(),
                     rpf_name: rname.clone(),
                     name: format!("sound_{awc_idx:04}_{sc}st.awc"),
                     kind: "AWC",
-                    offset: off + pos as u64,
+                    offset: abs_off,
                     comp_size: 0,
                     raw_size: 0,
                     tracks: sc,
@@ -3858,6 +3871,7 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
                 if (1..=500_000).contains(&frames) && frames == frames2 && (64..=8192).contains(&w) && (64..=8192).contains(&h) && fn_ > 0 && fd_ > 0 && tot >= 1024 && tot <= sz - (off + pos as u64) {
                     bk2_idx += 1;
                     let abs_off = off + pos as u64;
+                    claimed.insert(abs_off);
                     found.push(RpfEntry {
                         source_rpf: path.clone(),
                         rpf_name: rname.clone(),
@@ -3907,6 +3921,10 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
 
         while i + 8 < data.len() {
             if is_zlib_head(&data[i..]) {
+                if claimed.contains(&(i as u64)) {
+                    i += 16;
+                    continue;
+                }
                 decomp.reset(true);
                 let end = (i + 1024 * 1024).min(data.len());
                 if let Ok(Status::StreamEnd) = decomp.decompress(&data[i..end], &mut out, FlushDecompress::Finish) {

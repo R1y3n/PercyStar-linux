@@ -2155,11 +2155,17 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
     }
     mesh.last_dragging = dragging;
 
-    let heavy = mesh.visible_tris().len() > 25_000;
+    let tri_count = mesh.visible_tris().len();
+    let heavy = tri_count > 25_000;
+    let very_heavy = tri_count > 120_000;
     let ppp = ui.ctx().pixels_per_point();
-    let res_scale = ppp * if dragging && heavy { 0.55 } else { 1.0 };
-    let target_w = ((rect.width() * res_scale) as usize).clamp(160, 1920);
-    let target_h = ((rect.height() * res_scale) as usize).clamp(120, 1200);
+    let res_scale = ppp * if dragging && very_heavy { 0.35 }
+        else if dragging && heavy { 0.5 }
+        else if very_heavy { 0.6 }
+        else if heavy { 0.8 }
+        else { 1.0 };
+    let target_w = ((rect.width() * res_scale) as usize).clamp(160, 1600);
+    let target_h = ((rect.height() * res_scale) as usize).clamp(120, 1000);
 
     if mesh.dirty || mesh.fb_w != target_w || mesh.fb_h != target_h || mesh.tex.is_none() {
         rasterize_mesh(mesh, target_w, target_h);
