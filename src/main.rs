@@ -600,6 +600,7 @@ struct ResolvedVehicleVariation {
     label: String,
     colour: Option<[f32; 3]>,
     entries: Vec<usize>,
+    part_names: Vec<String>,
     unresolved: Vec<u32>,
 }
 
@@ -1496,7 +1497,10 @@ impl Rpf9App {
             .unwrap()
             .entries
             .iter()
-            .filter(|entry| entry.kind == "META7A" && entry.rpf_name.eq_ignore_ascii_case("packs.rpf"))
+            .filter(|entry| {
+                entry.rpf_name.eq_ignore_ascii_case("packs.rpf")
+                    && matches!(entry.kind, "META7A" | "ANIM")
+            })
             .cloned()
             .collect();
         if entries.is_empty() {
@@ -1512,8 +1516,10 @@ impl Rpf9App {
                 let parsed = File::open(&entry.source_rpf)
                     .map_err(|error| error.to_string())
                     .and_then(|mut file| read_virtual_from_file(&mut file, entry.offset).map(|result| result.0))
+                    .ok()
+                    .filter(|bytes| meta7a::has_schema_enums(bytes))
                     .map(|bytes| vehicle_variations::parse_configurations(&bytes));
-                if let Ok(configurations) = parsed {
+                if let Some(configurations) = parsed {
                     vehicle_variations::merge_configurations(&mut database, configurations);
                 }
             }
@@ -1581,14 +1587,21 @@ impl Rpf9App {
                     &entries_by_hash,
                     &entry_names,
                 );
+                let entries = vehicle_variations::with_implicit_roofbar_mount(
+                    resolved.entries,
+                    implicit_mount,
+                    resolved.needs_roofbar_mount,
+                );
+                let part_names = entries
+                    .iter()
+                    .filter_map(|&entry| st.entries.get(entry))
+                    .map(|entry| model_file_stem(&entry.name))
+                    .collect();
                 ResolvedVehicleVariation {
                     label: format!("Configuration {:02}", index + 1),
                     colour: configuration.colour_argb.map(vehicle_variations::argb_to_linear_rgb),
-                    entries: vehicle_variations::with_implicit_roofbar_mount(
-                        resolved.entries,
-                        implicit_mount,
-                        resolved.needs_roofbar_mount,
-                    ),
+                    entries,
+                    part_names,
                     unresolved: resolved.unresolved,
                 }
             })
@@ -1841,12 +1854,12 @@ impl Rpf9App {
                                 }
                                 ui.label(
                                     RichText::new(format!(
-                                        "{} parts{}",
-                                        variation.entries.len(),
+                                        "{} models{}",
+                                        variation.part_names.len(),
                                         if variation.unresolved.is_empty() {
                                             String::new()
                                         } else {
-                                            format!(" · {} unresolved", variation.unresolved.len())
+                                            format!(" · {} ids with no model file", variation.unresolved.len())
                                         }
                                     ))
                                     .size(10.0)
@@ -1860,19 +1873,21 @@ impl Rpf9App {
                     .checked_sub(1)
                     .and_then(|index| self.vehicle_variations.get(index))
                 {
-                    if !variation.unresolved.is_empty() {
-                        let hashes = variation
-                            .unresolved
-                            .iter()
-                            .take(12)
-                            .map(|hash| format!("{hash:08x}"))
-                            .collect::<Vec<_>>()
-                            .join(", ");
+                    if !variation.part_names.is_empty() {
                         ui.label(
-                            RichText::new(format!("Unresolved part hashes: {hashes}"))
-                                .monospace()
-                                .size(9.5)
-                                .color(Color32::from_rgb(170, 130, 120)),
+                            RichText::new(format!("Models in this build: {}", variation.part_names.join(", ")))
+                                .size(10.5)
+                                .color(Color32::from_rgb(180, 210, 190)),
+                        );
+                    }
+                    if !variation.unresolved.is_empty() {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} configuration ids do not match any model filename in the scanned archives.",
+                                variation.unresolved.len()
+                            ))
+                            .size(10.5)
+                            .color(Color32::from_rgb(170, 150, 130)),
                         );
                     }
                 }
@@ -3667,13 +3682,6 @@ fn load_disk_cache() -> HashMap<String, Vec<RpfEntry>> {
             chunks,
         });
     }
-    // Older caches predate 0x7a indexing. Force only packs.rpf to rescan so
-    // authored vehicle configurations become available without discarding the
-    // expensive levels.rpf model cache.
-    map.retain(|_, entries| {
-        let is_packs = entries.first().is_some_and(|entry| entry.rpf_name.eq_ignore_ascii_case("packs.rpf"));
-        !is_packs || entries.iter().any(|entry| entry.kind == "META7A")
-    });
     map
 }
 
@@ -4060,7 +4068,7 @@ fn probe_meta7a_zlib(
     probe_dec.reset(true);
     let _ = probe_dec.decompress(&buf[zlib_at..end], probe_out, FlushDecompress::None);
     let olen = probe_dec.total_out() as usize;
-    if olen < 0x80 || &probe_out[0x10..0x15] != b"0DRPz" {
+    if olen < 0x80 || !meta7a::has_schema_enums(&probe_out[..olen]) {
         return None;
     }
     let vft = u64::from_le_bytes(probe_out[0..8].try_into().ok()?);
@@ -4110,6 +4118,11 @@ fn probe_rage9_page(
     if vft != 0 || !(0x5000_0000..0x5800_0000).contains(&bmap) {
         return None;
     }
+    // Schema resources such as vehicle configurations share the 0DRPz tag with
+    // clip dictionaries. Enum definitions distinguish them before the anim probe.
+    if let Some(meta) = probe_meta7a_zlib(buf, p, read_n, off, path, rname, probe_dec, probe_out) {
+        return Some(meta);
+    }
     // 0. crClipDictionary (.ycd animation dictionary with 0DRPz tag at +0x10)
     if let Some((aname, clip_cnt)) = anim::probe_anim_dict(&probe_out[..olen]) {
         return Some(RpfEntry {
@@ -4123,9 +4136,6 @@ fn probe_rage9_page(
             tracks: clip_cnt,
             chunks: Vec::new(),
         });
-    }
-    if let Some(meta) = probe_meta7a_zlib(buf, p, read_n, off, path, rname, probe_dec, probe_out) {
-        return Some(meta);
     }
     // reject mid resource virtual chunks that start directly with a grmgeometry struct
     if u64::from_le_bytes(probe_out[0x60..0x68].try_into().ok()?) == 0x1601 {
@@ -5254,6 +5264,22 @@ mod tests {
         assert!(parse_semver("1.1.0") > parse_semver("1.0.99"));
         assert!(parse_semver("v1.0.3") == parse_semver("1.0.3"));
         assert!(parse_semver("bad").is_none());
+    }
+
+    /// PERCYSTAR_PACKS_RPF=<packs.rpf> cargo test packs_vehicle_table_is_schema_not_animation -- --nocapture
+    #[test]
+    fn packs_vehicle_table_is_schema_not_animation() {
+        let Ok(path) = std::env::var("PERCYSTAR_PACKS_RPF") else { return };
+        let path = PathBuf::from(path);
+        if !path.exists() {
+            return;
+        }
+        let mut file = File::open(path).expect("open packs.rpf");
+        let (bytes, _, _) = read_virtual_from_file(&mut file, 0x0bae_c010).expect("read vehicle table");
+        assert!(meta7a::has_schema_enums(&bytes), "vehicle tables must not be classified as clip dictionaries");
+        let configurations = vehicle_variations::parse_configurations(&bytes);
+        let stanier = configurations.get(&psin::joaat("stanierg2")).expect("stanierg2 configurations");
+        assert!(stanier.len() >= 20, "expected the authored stanierg2 rows, got {}", stanier.len());
     }
 
     /// PERCYSTAR_PACKS_RPF=<packs.rpf> cargo test authored_stanierg2_configurations -- --ignored --nocapture

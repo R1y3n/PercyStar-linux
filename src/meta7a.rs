@@ -41,6 +41,14 @@ fn system_offset(pointer: u64) -> Option<usize> {
     ((pointer >> 28) == 5).then_some((pointer & 0x0fff_ffff) as usize)
 }
 
+/// Clip dictionaries are also `0DRPz`, but their enum count at `+0x4A` is zero.
+/// Vehicle and other schema resources have at least one enum definition.
+pub fn has_schema_enums(data: &[u8]) -> bool {
+    data.len() >= 0x50
+        && data.get(0x10..0x15) == Some(b"0DRPz")
+        && u16_at(data, 0x4a).is_some_and(|count| count > 0)
+}
+
 impl<'a> Meta7a<'a> {
     pub fn parse(data: &'a [u8]) -> Option<Self> {
         if data.len() < 0x50 || data.get(0x10..0x15) != Some(b"0DRPz") {
@@ -179,6 +187,23 @@ impl<'a> Meta7a<'a> {
                 _ => None,
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_schema_enums;
+
+    #[test]
+    fn schema_enums_distinguish_vehicle_meta_from_clip_dictionaries() {
+        let mut meta = vec![0u8; 0x50];
+        meta[0x10..0x15].copy_from_slice(b"0DRPz");
+        meta[0x4a..0x4c].copy_from_slice(&19u16.to_le_bytes());
+        assert!(has_schema_enums(&meta));
+
+        let mut clip = meta.clone();
+        clip[0x4a..0x4c].copy_from_slice(&0u16.to_le_bytes());
+        assert!(!has_schema_enums(&clip));
     }
 }
 
