@@ -6,6 +6,7 @@ mod boot;
 mod dat;
 mod dxbc;
 mod mapdata;
+mod meta7a;
 mod psin;
 mod rsc9;
 mod sgd5;
@@ -14,10 +15,11 @@ mod worldmap;
 mod model3d;
 mod rdna2;
 mod tex;
+mod vehicle_variations;
 use model3d::{
     Mesh3D, decode_rage9_model_from_rpf, decode_rage9_model_from_rpf_lod, extract_0drpz_mesh, extract_rage9_model_name,
     has_rage9_meshlets, is_vehicle_virtual, is_zlib_head, parse_obj,
-    probe_large_rage9_model_in_buf, render_mesh3d_viewport,
+    probe_large_rage9_model_in_buf, read_virtual_from_file, render_mesh3d_viewport,
 };
 use rdna2::{
     Ps09Cache, Ps09ResourceName, Ps09ShaderEntry, ShaderStage, format_gfx103_disasm,
@@ -578,7 +580,8 @@ struct MediaState {
     bink_hwnd: Option<isize>,
     bink_clip: Option<PathBuf>,
     loaded_mesh: Option<Mesh3D>,
-    loaded_vehicle_parts: Vec<(usize, Mesh3D)>,
+    loaded_vehicle_parts: Vec<(usize, usize, Mesh3D)>,
+    loaded_vehicle_configurations: Option<(u64, vehicle_variations::VehicleConfigurationDb)>,
     loaded_textures: Option<Vec<DecodedTexture>>,
     // textures bound by the viewed model with a summary note the model stays loaded behind them
     loaded_model_textures: Option<(Vec<DecodedTexture>, String)>,
@@ -590,6 +593,14 @@ struct VehiclePartCandidate {
     name: String,
     enabled: bool,
     loading: bool,
+}
+
+#[derive(Clone)]
+struct ResolvedVehicleVariation {
+    label: String,
+    colour: Option<[f32; 3]>,
+    entries: Vec<usize>,
+    unresolved: Vec<u32>,
 }
 
 #[derive(Default)]
@@ -789,6 +800,13 @@ struct Rpf9App {
     vehicle_parts: Vec<VehiclePartCandidate>,
     vehicle_part_meshes: HashMap<usize, Mesh3D>,
     vehicle_part_filter: String,
+    vehicle_configuration_db: vehicle_variations::VehicleConfigurationDb,
+    vehicle_configuration_loaded: bool,
+    vehicle_configuration_loading: bool,
+    vehicle_configuration_generation: u64,
+    vehicle_variations: Vec<ResolvedVehicleVariation>,
+    vehicle_variation_selected: usize,
+    vehicle_variation_filter: String,
     // textures button clicked in the viewer header applied at the start of the next frame
     tex_pick: bool,
     // shown textures belong to the viewed model so the viewer offers a way back to it
@@ -969,6 +987,13 @@ impl Rpf9App {
             vehicle_parts: Vec::new(),
             vehicle_part_meshes: HashMap::new(),
             vehicle_part_filter: String::new(),
+            vehicle_configuration_db: HashMap::new(),
+            vehicle_configuration_loaded: false,
+            vehicle_configuration_loading: false,
+            vehicle_configuration_generation: 0,
+            vehicle_variations: Vec::new(),
+            vehicle_variation_selected: 0,
+            vehicle_variation_filter: String::new(),
             tex_pick: false,
             tex_from_model: false,
             lod_keep_cam: None,
@@ -1032,6 +1057,9 @@ impl Rpf9App {
         self.vehicle_parts.clear();
         self.vehicle_part_meshes.clear();
         self.vehicle_part_filter.clear();
+        self.vehicle_variations.clear();
+        self.vehicle_variation_selected = 0;
+        self.vehicle_variation_filter.clear();
         self.tex_pick = false;
         self.tex_from_model = false;
         self.lod_keep_cam = None;
@@ -1153,6 +1181,10 @@ impl Rpf9App {
         self.is_folder = false;
         self.selected_rpf = "All RPFs".into();
         self.reset_selection();
+        self.vehicle_configuration_db.clear();
+        self.vehicle_configuration_loaded = false;
+        self.vehicle_configuration_loading = false;
+        self.vehicle_configuration_generation = 0;
         let _gen = self.bump_gen();
         {
             let mut st = self.state.lock().unwrap();
@@ -1196,6 +1228,10 @@ impl Rpf9App {
         self.target_path = Some(folder.clone());
         self.is_folder = true;
         self.reset_selection();
+        self.vehicle_configuration_db.clear();
+        self.vehicle_configuration_loaded = false;
+        self.vehicle_configuration_loading = false;
+        self.vehicle_configuration_generation = 0;
         let gen = self.bump_gen();
         {
             let mut st = self.state.lock().unwrap();
@@ -1450,10 +1486,154 @@ impl Rpf9App {
         out
     }
 
+    fn ensure_vehicle_configuration_db(&mut self) {
+        if self.vehicle_configuration_loading || self.vehicle_configuration_loaded {
+            return;
+        }
+        let entries: Vec<RpfEntry> = self
+            .state
+            .lock()
+            .unwrap()
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == "META7A" && entry.rpf_name.eq_ignore_ascii_case("packs.rpf"))
+            .cloned()
+            .collect();
+        if entries.is_empty() {
+            return;
+        }
+        let generation = *self.watch_gen.lock().unwrap();
+        self.vehicle_configuration_generation = generation;
+        self.vehicle_configuration_loading = true;
+        let media = Arc::clone(&self.media);
+        std::thread::spawn(move || {
+            let mut database = vehicle_variations::VehicleConfigurationDb::new();
+            for entry in entries {
+                let parsed = File::open(&entry.source_rpf)
+                    .map_err(|error| error.to_string())
+                    .and_then(|mut file| read_virtual_from_file(&mut file, entry.offset).map(|result| result.0))
+                    .map(|bytes| vehicle_variations::parse_configurations(&bytes));
+                if let Ok(configurations) = parsed {
+                    vehicle_variations::merge_configurations(&mut database, configurations);
+                }
+            }
+            media.lock().unwrap().loaded_vehicle_configurations = Some((generation, database));
+        });
+    }
+
+    fn refresh_vehicle_variations(&mut self) {
+        let Some(model_index) = self.model_entry else {
+            self.vehicle_variations.clear();
+            return;
+        };
+        let st = self.state.lock().unwrap();
+        let Some(model) = st.entries.get(model_index) else { return };
+        if model.kind != "VEH" {
+            self.vehicle_variations.clear();
+            return;
+        }
+        let base = model_file_stem(&model.name);
+        let model_hash = psin::joaat(&base);
+        let Some(configurations) = self.vehicle_configuration_db.get(&model_hash) else {
+            self.vehicle_variations.clear();
+            self.vehicle_variation_selected = 0;
+            return;
+        };
+        let wants_hi = model.name.rsplit_once('.').map(|part| part.0).unwrap_or(&model.name).to_ascii_lowercase().ends_with("_hi");
+        let mut entries_by_hash: HashMap<u32, (usize, bool)> = HashMap::new();
+        for (index, entry) in st.entries.iter().enumerate() {
+            if (entry.kind != "MODEL" && entry.kind != "VEH") || entry.source_rpf != model.source_rpf {
+                continue;
+            }
+            let raw = entry.name.rsplit_once('.').map(|part| part.0).unwrap_or(&entry.name).to_ascii_lowercase();
+            let logical = raw.strip_suffix("_hi").or_else(|| raw.strip_suffix("_mid")).unwrap_or(&raw);
+            let detail_match = raw.ends_with("_hi") == wants_hi;
+            for hash in [psin::joaat(logical), psin::joaat(&raw)] {
+                let preferred = vehicle_variations::prefer_lod_entry(entries_by_hash.get(&hash).copied(), index, detail_match);
+                entries_by_hash.insert(hash, preferred);
+            }
+        }
+
+        let mount_prefix = format!("{base}_siren_roofbar1_mount_");
+        let implicit_mount = st
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| (entry.kind == "MODEL" || entry.kind == "VEH") && entry.source_rpf == model.source_rpf)
+            .filter_map(|(index, entry)| {
+                let raw = entry.name.rsplit_once('.').map(|part| part.0).unwrap_or(&entry.name).to_ascii_lowercase();
+                raw.starts_with(&mount_prefix).then_some((index, raw.ends_with("_hi") == wants_hi, raw))
+            })
+            .min_by(|a, b| (!a.1, &a.2).cmp(&(!b.1, &b.2)))
+            .map(|item| item.0);
+
+        let entry_names: HashMap<usize, String> = entries_by_hash
+            .values()
+            .map(|&(entry, _)| (entry, st.entries[entry].name.clone()))
+            .collect();
+        self.vehicle_variations = configurations
+            .iter()
+            .enumerate()
+            .map(|(index, configuration)| {
+                let resolved = vehicle_variations::resolve_configuration_parts(
+                    model_hash,
+                    &configuration.parts,
+                    &entries_by_hash,
+                    &entry_names,
+                );
+                ResolvedVehicleVariation {
+                    label: format!("Configuration {:02}", index + 1),
+                    colour: configuration.colour_argb.map(vehicle_variations::argb_to_linear_rgb),
+                    entries: vehicle_variations::with_implicit_roofbar_mount(
+                        resolved.entries,
+                        implicit_mount,
+                        resolved.needs_roofbar_mount,
+                    ),
+                    unresolved: resolved.unresolved,
+                }
+            })
+            .collect();
+        self.vehicle_variation_selected = self.vehicle_variation_selected.min(self.vehicle_variations.len());
+    }
+
+    fn apply_vehicle_variation(&mut self, selected: usize) {
+        self.vehicle_variation_selected = selected.min(self.vehicle_variations.len());
+        if self.vehicle_variation_selected > 0 {
+            for part in &mut self.vehicle_parts {
+                part.enabled = false;
+            }
+        }
+        let entries = self
+            .vehicle_variation_selected
+            .checked_sub(1)
+            .and_then(|index| self.vehicle_variations.get(index))
+            .map(|variation| variation.entries.clone())
+            .unwrap_or_default();
+        for entry in entries {
+            if !self.vehicle_part_meshes.contains_key(&entry) {
+                self.spawn_vehicle_part_decode(entry);
+            }
+        }
+        self.rebuild_vehicle_parts();
+    }
+
     fn rebuild_vehicle_parts(&mut self) {
         let Some(mut mesh) = self.vehicle_base_mesh.clone() else { return };
+        let mut appended = std::collections::HashSet::new();
+        if let Some(variation) = self
+            .vehicle_variation_selected
+            .checked_sub(1)
+            .and_then(|index| self.vehicle_variations.get(index))
+        {
+            for &entry in &variation.entries {
+                if let Some(part) = self.vehicle_part_meshes.get(&entry) {
+                    mesh.append_vehicle_part(part.clone());
+                    appended.insert(entry);
+                }
+            }
+        }
         for choice in &self.vehicle_parts {
-            if choice.enabled {
+            if choice.enabled && appended.insert(choice.entry) {
                 if let Some(part) = self.vehicle_part_meshes.get(&choice.entry) {
                     mesh.append_vehicle_part(part.clone());
                 }
@@ -1462,7 +1642,12 @@ impl Rpf9App {
         if let Some(current) = self.mesh3d.as_ref() {
             (mesh.yaw, mesh.pitch, mesh.zoom, mesh.pan_x, mesh.pan_y) =
                 (current.yaw, current.pitch, current.zoom, current.pan_x, current.pan_y);
-            mesh.paint_color = current.paint_color;
+            mesh.paint_color = self
+                .vehicle_variation_selected
+                .checked_sub(1)
+                .and_then(|index| self.vehicle_variations.get(index))
+                .and_then(|variation| variation.colour)
+                .unwrap_or(current.paint_color);
             mesh.els_enabled = current.els_enabled && mesh.has_els;
             mesh.els_flash = current.els_flash;
         }
@@ -1471,12 +1656,13 @@ impl Rpf9App {
 
     fn spawn_vehicle_part_decode(&self, entry: usize) {
         let Some(e) = self.state.lock().unwrap().entries.get(entry).cloned() else { return };
+        let Some(owner) = self.model_entry else { return };
         let media = Arc::clone(&self.media);
         std::thread::spawn(move || {
             let result = decode_rage9_model_from_rpf_lod(&e.source_rpf, e.offset, &e.name, 0);
             let mut m = media.lock().unwrap();
             match result {
-                Ok(mesh) => m.loaded_vehicle_parts.push((entry, mesh)),
+                Ok(mesh) => m.loaded_vehicle_parts.push((owner, entry, mesh)),
                 Err(err) => m.status = format!("Vehicle part decode error ({}): {err}", e.name),
             }
         });
@@ -1521,7 +1707,7 @@ impl Rpf9App {
         let enabled = self.vehicle_parts.iter().filter(|p| p.enabled).count();
         let mut loads = Vec::new();
         let mut rebuild = false;
-        egui::CollapsingHeader::new(format!("Vehicle Parts ({enabled}/{})", self.vehicle_parts.len()))
+        egui::CollapsingHeader::new(format!("Advanced / Manual Parts ({enabled}/{})", self.vehicle_parts.len()))
             .id_salt("vehicle_parts")
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -1572,6 +1758,127 @@ impl Rpf9App {
         }
         if rebuild {
             self.rebuild_vehicle_parts();
+        }
+    }
+
+    fn vehicle_variations_ui(&mut self, ui: &mut egui::Ui) {
+        let is_vehicle = self
+            .model_entry
+            .and_then(|index| self.state.lock().unwrap().entries.get(index).map(|entry| entry.kind == "VEH"))
+            .unwrap_or(false);
+        if !is_vehicle {
+            return;
+        }
+        self.ensure_vehicle_configuration_db();
+        if self.vehicle_configuration_loading {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Reading authored vehicle configurations from packs.rpf…");
+            });
+            return;
+        }
+        if self.vehicle_configuration_db.is_empty() {
+            ui.label(
+                RichText::new("Authored variations unavailable: packs.rpf metadata was not found in the current scan.")
+                    .size(11.0)
+                    .color(Color32::from_rgb(180, 145, 110)),
+            );
+            return;
+        }
+        if self.vehicle_variations.is_empty() {
+            ui.label(
+                RichText::new("No authored fixed configurations were found for this vehicle.")
+                    .size(11.0)
+                    .color(Color32::from_rgb(150, 160, 180)),
+            );
+            return;
+        }
+
+        let selected_label = self
+            .vehicle_variation_selected
+            .checked_sub(1)
+            .and_then(|index| self.vehicle_variations.get(index))
+            .map(|variation| variation.label.as_str())
+            .unwrap_or("Stock / base model");
+        let mut selection = None;
+        egui::CollapsingHeader::new(format!("Vehicle Variation · {selected_label}"))
+            .id_salt("vehicle_variations")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.vehicle_variation_filter)
+                            .hint_text("Filter configurations…")
+                            .desired_width(260.0),
+                    );
+                    if ui.selectable_label(self.vehicle_variation_selected == 0, "Stock / base").clicked() {
+                        selection = Some(0);
+                    }
+                });
+                let filter = self.vehicle_variation_filter.trim().to_ascii_lowercase();
+                egui::ScrollArea::vertical()
+                    .id_salt("vehicle_variations_list")
+                    .max_height(150.0)
+                    .show(ui, |ui| {
+                        for (index, variation) in self.vehicle_variations.iter().enumerate() {
+                            if !filter.is_empty() && !variation.label.to_ascii_lowercase().contains(&filter) {
+                                continue;
+                            }
+                            ui.horizontal(|ui| {
+                                if let Some(rgb) = variation.colour {
+                                    let colour = Color32::from_rgb(
+                                        (rgb[0] * 255.0).round() as u8,
+                                        (rgb[1] * 255.0).round() as u8,
+                                        (rgb[2] * 255.0).round() as u8,
+                                    );
+                                    ui.colored_label(colour, "■");
+                                }
+                                if ui
+                                    .selectable_label(self.vehicle_variation_selected == index + 1, &variation.label)
+                                    .clicked()
+                                {
+                                    selection = Some(index + 1);
+                                }
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} parts{}",
+                                        variation.entries.len(),
+                                        if variation.unresolved.is_empty() {
+                                            String::new()
+                                        } else {
+                                            format!(" · {} unresolved", variation.unresolved.len())
+                                        }
+                                    ))
+                                    .size(10.0)
+                                    .color(Color32::from_rgb(135, 145, 165)),
+                                );
+                            });
+                        }
+                    });
+                if let Some(variation) = self
+                    .vehicle_variation_selected
+                    .checked_sub(1)
+                    .and_then(|index| self.vehicle_variations.get(index))
+                {
+                    if !variation.unresolved.is_empty() {
+                        let hashes = variation
+                            .unresolved
+                            .iter()
+                            .take(12)
+                            .map(|hash| format!("{hash:08x}"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        ui.label(
+                            RichText::new(format!("Unresolved part hashes: {hashes}"))
+                                .monospace()
+                                .size(9.5)
+                                .color(Color32::from_rgb(170, 130, 120)),
+                        );
+                    }
+                }
+            });
+        if let Some(selected) = selection {
+            self.apply_vehicle_variation(selected);
         }
     }
 
@@ -1745,6 +2052,10 @@ impl Rpf9App {
             self.lod_siblings = self.find_lod_siblings(&e);
             self.vehicle_parts = self.find_vehicle_parts(&e);
             self.model_entry = Some(idx);
+            if e.kind == "VEH" {
+                self.ensure_vehicle_configuration_db();
+                self.refresh_vehicle_variations();
+            }
             self.spawn_model_decode(&e, 0);
             return;
         }
@@ -1990,7 +2301,7 @@ impl Rpf9App {
                     "BK2" => 6,
                     "AWC" => 7,
                     "XML" => 8,
-                    "PSIN" | "ANIM" | "RSC9" => 9,
+                    "PSIN" | "ANIM" | "RSC9" | "META7A" => 9,
                     _ => 10,
                 }] += 1;
             }
@@ -2015,7 +2326,7 @@ impl Rpf9App {
                     Category::Videos => e.kind == "BK2",
                     Category::Audio => e.kind == "AWC",
                     Category::Xml => e.kind == "XML",
-                    Category::Resources => matches!(e.kind, "PSIN" | "ANIM" | "RSC9"),
+                    Category::Resources => matches!(e.kind, "PSIN" | "ANIM" | "RSC9" | "META7A"),
                     Category::Binary => e.kind == "ZLIB",
                 };
                 let h = &self.hay[*i];
@@ -2377,6 +2688,7 @@ impl Rpf9App {
                 } else if self.tex_from_model && !self.textures.is_empty() {
                     self.render_texture_viewer(ui);
                 } else if self.mesh3d.is_some() {
+                    self.vehicle_variations_ui(ui);
                     self.vehicle_parts_ui(ui);
                     let mesh = self.mesh3d.as_mut().unwrap();
                     ui.horizontal_wrapped(|ui| {
@@ -3329,6 +3641,7 @@ fn load_disk_cache() -> HashMap<String, Vec<RpfEntry>> {
             "PSIN" => "PSIN",
             "ANIM" => "ANIM",
             "RSC9" => "RSC9",
+            "META7A" => "META7A",
             _ => "ZLIB",
         };
         // tolerate old 11 col cache rows and newer 10 col ones
@@ -3354,6 +3667,13 @@ fn load_disk_cache() -> HashMap<String, Vec<RpfEntry>> {
             chunks,
         });
     }
+    // Older caches predate 0x7a indexing. Force only packs.rpf to rescan so
+    // authored vehicle configurations become available without discarding the
+    // expensive levels.rpf model cache.
+    map.retain(|_, entries| {
+        let is_packs = entries.first().is_some_and(|entry| entry.rpf_name.eq_ignore_ascii_case("packs.rpf"));
+        !is_packs || entries.iter().any(|entry| entry.kind == "META7A")
+    });
     map
 }
 
@@ -3723,6 +4043,44 @@ fn extract_xml_tag(bytes: &[u8]) -> Option<String> {
     None
 }
 
+fn probe_meta7a_zlib(
+    buf: &[u8],
+    zlib_at: usize,
+    read_n: usize,
+    off: u64,
+    path: &Path,
+    rname: &str,
+    probe_dec: &mut Decompress,
+    probe_out: &mut [u8],
+) -> Option<RpfEntry> {
+    if zlib_at + 8 > read_n || !is_zlib_head(&buf[zlib_at..read_n]) {
+        return None;
+    }
+    let end = (zlib_at + 32768).min(read_n);
+    probe_dec.reset(true);
+    let _ = probe_dec.decompress(&buf[zlib_at..end], probe_out, FlushDecompress::None);
+    let olen = probe_dec.total_out() as usize;
+    if olen < 0x80 || &probe_out[0x10..0x15] != b"0DRPz" {
+        return None;
+    }
+    let vft = u64::from_le_bytes(probe_out[0..8].try_into().ok()?);
+    let bmap = u64::from_le_bytes(probe_out[8..16].try_into().ok()?);
+    if vft != 0 || !(0x5000_0000..0x5800_0000).contains(&bmap) {
+        return None;
+    }
+    Some(RpfEntry {
+        source_rpf: path.to_path_buf(),
+        rpf_name: rname.to_string(),
+        name: format!("meta7a_{:012x}.#7a", off + zlib_at as u64),
+        kind: "META7A",
+        offset: off + zlib_at as u64,
+        comp_size: probe_dec.total_in(),
+        raw_size: olen as u64,
+        tracks: 0,
+        chunks: Vec::new(),
+    })
+}
+
 // shared rage9 page detector used by both veh scanner and full archive pass
 fn probe_rage9_page(
     buf: &[u8],
@@ -3734,6 +4092,10 @@ fn probe_rage9_page(
     probe_dec: &mut Decompress,
     probe_out: &mut [u8],
 ) -> Option<RpfEntry> {
+    // packs.rpf vehicle tables are often indexed at the zlib stream itself.
+    if let Some(meta) = probe_meta7a_zlib(buf, pos, read_n, off, path, rname, probe_dec, probe_out) {
+        return Some(meta);
+    }
     let p = pos + 0x10;
     if p + 8 > read_n || !is_zlib_head(&buf[p..read_n]) {
         return None;
@@ -3762,8 +4124,8 @@ fn probe_rage9_page(
             chunks: Vec::new(),
         });
     }
-    if &probe_out[0x10..0x15] == b"0DRPz" {
-        return None;
+    if let Some(meta) = probe_meta7a_zlib(buf, p, read_n, off, path, rname, probe_dec, probe_out) {
+        return Some(meta);
     }
     // reject mid resource virtual chunks that start directly with a grmgeometry struct
     if u64::from_le_bytes(probe_out[0x60..0x68].try_into().ok()?) == 0x1601 {
@@ -4248,6 +4610,16 @@ impl eframe::App for Rpf9App {
         let (media_loading, media_status) = {
             let media = Arc::clone(&self.media);
             let mut m = media.lock().unwrap();
+            if let Some((generation, database)) = m.loaded_vehicle_configurations.take() {
+                if generation == self.vehicle_configuration_generation
+                    && generation == *self.watch_gen.lock().unwrap()
+                {
+                    self.vehicle_configuration_db = database;
+                    self.vehicle_configuration_loaded = true;
+                    self.vehicle_configuration_loading = false;
+                    self.refresh_vehicle_variations();
+                }
+            }
             if let Some(mut mesh) = m.loaded_mesh.take() {
                 self.textures.clear();
                 self.tex_handle = None;
@@ -4258,7 +4630,11 @@ impl eframe::App for Rpf9App {
                 if let Some((lbl, _)) = self.lod_siblings.iter().find(|(_, i)| Some(*i) == self.selected) {
                     mesh.lod_label = format!("{lbl} detail file · {}", mesh.lod_label);
                 }
-                if !self.vehicle_parts.is_empty() {
+                let is_vehicle = self
+                    .model_entry
+                    .and_then(|index| self.state.lock().unwrap().entries.get(index).map(|entry| entry.kind == "VEH"))
+                    .unwrap_or(false);
+                if is_vehicle {
                     self.vehicle_base_mesh = Some(mesh.clone());
                 }
                 self.mesh3d = Some(mesh);
@@ -4269,7 +4645,10 @@ impl eframe::App for Rpf9App {
             }
             let loaded_parts: Vec<_> = m.loaded_vehicle_parts.drain(..).collect();
             let had_loaded_parts = !loaded_parts.is_empty();
-            for (entry, mesh) in loaded_parts {
+            for (owner, entry, mesh) in loaded_parts {
+                if Some(owner) != self.model_entry {
+                    continue;
+                }
                 self.vehicle_part_meshes.insert(entry, mesh);
                 if let Some(choice) = self.vehicle_parts.iter_mut().find(|p| p.entry == entry) {
                     choice.loading = false;
@@ -4714,6 +5093,7 @@ impl eframe::App for Rpf9App {
             } else if !self.textures.is_empty() {
                 self.render_texture_viewer(ui);
             } else if self.mesh3d.is_some() {
+                self.vehicle_variations_ui(ui);
                 self.vehicle_parts_ui(ui);
                 let mesh = self.mesh3d.as_mut().unwrap();
                 let mut toggle_3d = self.show_3d;
@@ -4874,6 +5254,63 @@ mod tests {
         assert!(parse_semver("1.1.0") > parse_semver("1.0.99"));
         assert!(parse_semver("v1.0.3") == parse_semver("1.0.3"));
         assert!(parse_semver("bad").is_none());
+    }
+
+    /// PERCYSTAR_PACKS_RPF=<packs.rpf> cargo test authored_stanierg2_configurations -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn authored_stanierg2_configurations() {
+        let Ok(path) = std::env::var("PERCYSTAR_PACKS_RPF") else { return };
+        let path = PathBuf::from(path);
+        let (_, entries) = scan_single_rpf(&path, None).expect("scan packs.rpf");
+        let mut metadata: Vec<_> = entries.iter().filter(|entry| entry.kind == "META7A").collect();
+        // Known table resource in this supported build; also makes the fixture
+        // useful when an imported/partial catalog did not index metadata rows.
+        let fallback;
+        if metadata.is_empty() {
+            // Known packs.rpf vehicle-config resource for this supported build.
+            fallback = RpfEntry {
+                source_rpf: path.clone(),
+                rpf_name: "packs.rpf".into(),
+                name: "vehicle_tables.#7a".into(),
+                kind: "META7A",
+                offset: 0x0bae_c010,
+                comp_size: 0,
+                raw_size: 0,
+                tracks: 0,
+                chunks: Vec::new(),
+            };
+            metadata.push(&fallback);
+        }
+        assert!(!metadata.is_empty(), "no 0x7a metadata resources indexed");
+        let mut database = vehicle_variations::VehicleConfigurationDb::new();
+        let mut failures = 0usize;
+        for entry in &metadata {
+            let mut file = File::open(&entry.source_rpf).expect("open packs.rpf");
+            match read_virtual_from_file(&mut file, entry.offset) {
+                Ok((bytes, _, _)) => vehicle_variations::merge_configurations(
+                    &mut database,
+                    vehicle_variations::parse_configurations(&bytes),
+                ),
+                Err(_) => failures += 1,
+            }
+        }
+        assert!(failures < metadata.len(), "failed to decode every packs.rpf 0x7a resource");
+        let configurations = database
+            .get(&psin::joaat("stanierg2"))
+            .unwrap_or_else(|| panic!("stanierg2 configurations missing after {} meta resources", metadata.len()));
+        assert!(
+            configurations.len() >= 20,
+            "expected ~23 stanierg2 configurations, got {}",
+            configurations.len()
+        );
+        assert!(
+            configurations.iter().any(|configuration| {
+                !configuration.parts.is_empty()
+                    && configuration.parts.contains(&psin::joaat("cmn_siren_roofbar1_02"))
+            }),
+            "stanierg2 police configuration should reference the shared roofbar with a resolved part list"
+        );
     }
 
     #[test]

@@ -741,7 +741,8 @@ pub fn read_virtual_from_file(f: &mut File, file_off: u64) -> Result<(Vec<u8>, u
     }
     let v_cnt = v[bmap_off + 8] as usize;
     let p_cnt = v[bmap_off + 9] as usize;
-    if !(1..=32).contains(&v_cnt) || !(1..=64).contains(&p_cnt) {
+    // Meta-only 0x7a resources legitimately use p_cnt = 0 (no graphics pages).
+    if !(1..=32).contains(&v_cnt) || p_cnt > 64 {
         return Err(format!("Invalid RAGE9 BlockMap counts (v={v_cnt}, p={p_cnt})"));
     }
     for _ in v_chunks_read..v_cnt {
