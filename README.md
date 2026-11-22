@@ -19,7 +19,7 @@ This repo keeps the original PercyStar codebase and adds the changes needed to b
 Linux builds are published on the [Releases](https://github.com/R1y3n/PercyStar-linux/releases) page.
 
 - `PercyStar-linux-x64.tar.gz` - plain Linux x64 build (extract and run `./PercyStar`)
-- `PercyStar-linux-x86_64.AppImage` - AppImage build (mark executable and run; if FUSE is unavailable, use `--appimage-extract-and-run`)
+- `PercyStar-linux-x86_64.AppImage` - AppImage build (mark executable and run)
 
 ## Build on GitHub
 
@@ -43,6 +43,13 @@ Options:
 - `--min-size N` / `--max-size N` - size filter (`bytes`, or `KB`/`MB`/`GB`)
 - `--limit N` - stop after N matches
 - `--json` - print one JSON object per match
+
+## AppImage notes
+
+- Built on Ubuntu 22.04, so it targets glibc 2.35+ systems.
+- Bundles app dependencies through linuxdeploy/appimagetool; GPU drivers still come from the host.
+- If FUSE is not available, run with `--appimage-extract-and-run`.
+- Sets `GIO_MODULE_DIR` inside the AppImage to avoid host GIO module symbol mismatches.
 
 ## Notes
 

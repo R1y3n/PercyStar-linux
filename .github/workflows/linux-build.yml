@@ -97,6 +97,12 @@ jobs:
             tail -120 linuxdeploy.log || true
             exit $rc
           fi
+          mkdir -p AppDir/usr/lib/gio/modules AppDir/apprun-hooks
+          cat > AppDir/apprun-hooks/fix-env.sh << 'HOOK'
+          # avoid loading host GIO modules against bundled GLib
+          export GIO_MODULE_DIR="${APPDIR}/usr/lib/gio/modules"
+          unset GIO_EXTRA_MODULES
+          HOOK
           ARCH=x86_64 ./appimagetool.AppImage AppDir PercyStar-linux-x86_64.AppImage 2>&1 | tee appimagetool.log; rc=${PIPESTATUS[0]}
           if [ $rc -ne 0 ]; then
             echo "--- appimagetool failed rc=$rc ---"
