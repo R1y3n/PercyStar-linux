@@ -83,6 +83,12 @@ pub struct TexLayer {
     failed: bool,
 }
 
+#[derive(Clone, Copy)]
+pub struct ElsPoint {
+    pub position: [f32; 3],
+    pub bank: bool,
+}
+
 impl GeomMaterial {
     fn blends(&self, has_uvs: bool) -> bool {
         matches!(self.pass, MaterialPass::Glass { .. })
@@ -135,6 +141,11 @@ pub struct Mesh3D {
     pub tex_layers: Vec<TexLayer>,
     pub has_paint_geom: bool,
     pub paint_color: [f32; 3],
+    pub has_els: bool,
+    pub els_enabled: bool,
+    pub els_flash: bool,
+    pub els_points: Vec<ElsPoint>,
+    els_flash_on: bool,
     pub tex_status: String,
     pub center: [f32; 3],
     pub radius: f32,
@@ -219,20 +230,28 @@ impl Mesh3D {
     }
 
     fn refresh_tex_status(&mut self) {
-        if self.texture.is_some() || self.geom_materials.is_empty() {
+        if self.geom_materials.is_empty() {
             return;
         }
-        let textured = self.geom_materials.iter().filter(|m| m.texture.is_some()).count();
-        let paint = self.geom_materials.iter().filter(|m| m.is_vehicle_paint).count();
-        let drawn = self.geom_materials.iter().filter(|m| !m.auxiliary_pass).count().max(1);
-        if textured > 0 && paint > 0 {
-            self.tex_status = format!("TTPF: {textured}/{drawn} mats + Car Paint");
-        } else if textured > 0 {
-            self.tex_status = format!("TTPF: {textured}/{drawn} mats");
-        } else if paint > 0 {
-            self.tex_status = format!("Car Paint ({paint}/{drawn} geoms)");
-        } else if !self.tex_layers.is_empty() {
-            self.tex_status = "TTPF: no color textures applied".into();
+        if let Some(at) = self.tex_status.find(" + ELS ") {
+            self.tex_status.truncate(at);
+        }
+        if self.texture.is_none() {
+            let textured = self.geom_materials.iter().filter(|m| m.texture.is_some()).count();
+            let paint = self.geom_materials.iter().filter(|m| m.is_vehicle_paint).count();
+            let drawn = self.geom_materials.iter().filter(|m| !m.auxiliary_pass).count().max(1);
+            if textured > 0 && paint > 0 {
+                self.tex_status = format!("TTPF: {textured}/{drawn} mats + Car Paint");
+            } else if textured > 0 {
+                self.tex_status = format!("TTPF: {textured}/{drawn} mats");
+            } else if paint > 0 {
+                self.tex_status = format!("Car Paint ({paint}/{drawn} geoms)");
+            } else if !self.tex_layers.is_empty() {
+                self.tex_status = "TTPF: no color textures applied".into();
+            }
+        }
+        if self.has_els {
+            self.tex_status.push_str(&format!(" + ELS {} emitters", self.els_points.len()));
         }
     }
 
@@ -306,6 +325,11 @@ impl Mesh3D {
             has_paint_geom: false,
             tex_layers: Vec::new(),
             paint_color: DEFAULT_PAINT_COLOR,
+            has_els: false,
+            els_enabled: false,
+            els_flash: true,
+            els_points: Vec::new(),
+            els_flash_on: true,
             tex_status,
             center,
             radius,
@@ -1349,6 +1373,106 @@ fn extract_rage9_bone_count(v: &[u8]) -> usize {
     0
 }
 
+fn quat_mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    [
+        a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+        a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+        a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+        a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
+    ]
+}
+
+fn quat_rotate(q: [f32; 4], p: [f32; 3]) -> [f32; 3] {
+    let qv = [q[0], q[1], q[2]];
+    let uv = [
+        qv[1] * p[2] - qv[2] * p[1],
+        qv[2] * p[0] - qv[0] * p[2],
+        qv[0] * p[1] - qv[1] * p[0],
+    ];
+    let uuv = [
+        qv[1] * uv[2] - qv[2] * uv[1],
+        qv[2] * uv[0] - qv[0] * uv[2],
+        qv[0] * uv[1] - qv[1] * uv[0],
+    ];
+    [
+        p[0] + 2.0 * (q[3] * uv[0] + uuv[0]),
+        p[1] + 2.0 * (q[3] * uv[1] + uuv[1]),
+        p[2] + 2.0 * (q[3] * uv[2] + uuv[2]),
+    ]
+}
+
+// RAGE 9 vehicle ELS emitters are skeleton bones whose final token is siren<number>,
+// for example siren1, ext_front_siren2, or ext_rear_1_roof_siren1.
+// They are independent from emissiveTex, which is commonly the dashboard gauge atlas.
+fn extract_rage9_siren_points(v: &[u8]) -> Vec<ElsPoint> {
+    let mut bases = vec![0usize];
+    if v.len() >= 0x20 {
+        if let Some(fo) = vptr(ru64(v, 0x18)) {
+            if fo + 0x20 <= v.len() { bases.push(fo); }
+        }
+    }
+    for base in bases {
+        let Some(so) = (base + 0x20 <= v.len()).then(|| vptr(ru64(v, base + 0x18))).flatten() else { continue };
+        if so + 0x70 > v.len() { continue; }
+        let count = ru16(v, so + 0x6c) as usize;
+        let Some(bones) = vptr(ru64(v, so + 0x28)) else { continue };
+        if !(1..=1024).contains(&count) || bones + count * 0x50 > v.len() { continue; }
+
+        let mut world_rot = vec![[0.0, 0.0, 0.0, 1.0]; count];
+        let mut world_pos = vec![[0.0; 3]; count];
+        let mut world_scale = vec![[1.0; 3]; count];
+        let mut out = Vec::new();
+        for i in 0..count {
+            let b = bones + i * 0x50;
+            let mut rot = [rf32(v, b), rf32(v, b + 4), rf32(v, b + 8), rf32(v, b + 12)];
+            let len = (rot.iter().map(|x| x * x).sum::<f32>()).sqrt();
+            if len > 1e-6 {
+                for x in &mut rot { *x /= len; }
+            } else {
+                rot = [0.0, 0.0, 0.0, 1.0];
+            }
+            let pos = [rf32(v, b + 0x10), rf32(v, b + 0x14), rf32(v, b + 0x18)];
+            let scale = [rf32(v, b + 0x20), rf32(v, b + 0x24), rf32(v, b + 0x28)];
+            let parent = ru16(v, b + 0x46) as usize;
+            if parent < i {
+                let scaled = [
+                    pos[0] * world_scale[parent][0],
+                    pos[1] * world_scale[parent][1],
+                    pos[2] * world_scale[parent][2],
+                ];
+                let offset = quat_rotate(world_rot[parent], scaled);
+                world_pos[i] = [
+                    world_pos[parent][0] + offset[0],
+                    world_pos[parent][1] + offset[1],
+                    world_pos[parent][2] + offset[2],
+                ];
+                world_rot[i] = quat_mul(world_rot[parent], rot);
+                world_scale[i] = [
+                    world_scale[parent][0] * scale[0],
+                    world_scale[parent][1] * scale[1],
+                    world_scale[parent][2] * scale[2],
+                ];
+            } else {
+                world_pos[i] = pos;
+                world_rot[i] = rot;
+                world_scale[i] = scale;
+            }
+
+            let Some(name_off) = vptr(ru64(v, b + 0x30)) else { continue };
+            let end = v[name_off..].iter().position(|&c| c == 0).map(|n| name_off + n).unwrap_or(name_off);
+            let Ok(name) = std::str::from_utf8(&v[name_off..end]) else { continue };
+            let lower = name.to_ascii_lowercase();
+            let Some(siren_at) = lower.rfind("siren") else { continue };
+            let Some(number) = lower[siren_at + "siren".len()..].parse::<u16>().ok() else { continue };
+            out.push(ElsPoint { position: world_pos[i], bank: number % 2 == 0 });
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    Vec::new()
+}
+
 pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name: &str) -> Result<Mesh3D, String> {
     decode_rage9_model_from_rpf_lod(rpf_path, file_off, fallback_name, 0)
 }
@@ -1465,6 +1589,8 @@ pub fn decode_rage9_model_from_rpf_lod(rpf_path: &Path, file_off: u64, fallback_
     }
     layout_parts_in_grid(&mut b.verts, &part_verts);
 
+    let els_points = if is_vehicle { extract_rage9_siren_points(&v) } else { Vec::new() };
+
     // default look applies the first color candidate of every drawn material
     for m in geom_materials.iter().filter(|m| !m.auxiliary_pass) {
         for &i in m.color_layers.iter().chain(&m.normal_layers).chain(&m.overlay_layers) {
@@ -1493,6 +1619,8 @@ pub fn decode_rage9_model_from_rpf_lod(rpf_path: &Path, file_off: u64, fallback_
     );
     mesh.geom_materials = geom_materials;
     mesh.tex_layers = tex_layers;
+    mesh.has_els = !els_points.is_empty();
+    mesh.els_points = els_points;
     mesh.apply_tex_layers();
     mesh.bone_count = extract_rage9_bone_count(&v);
     mesh.lod = lod;
@@ -1549,6 +1677,15 @@ fn blend_preview_pixel(dst: &mut Color32, src: Color32, alpha: u8) {
     let a = alpha as u16;
     let mix = |s: u8, d: u8| ((s as u16 * a + d as u16 * (255 - a) + 127) / 255) as u8;
     *dst = Color32::from_rgb(mix(src.r(), dst.r()), mix(src.g(), dst.g()), mix(src.b(), dst.b()));
+}
+
+#[inline]
+fn add_preview_pixel(dst: &mut Color32, src: Color32, strength: f32) {
+    *dst = Color32::from_rgb(
+        (dst.r() as f32 + src.r() as f32 * strength).min(255.0) as u8,
+        (dst.g() as f32 + src.g() as f32 * strength).min(255.0) as u8,
+        (dst.b() as f32 + src.b() as f32 * strength).min(255.0) as u8,
+    );
 }
 
 fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
@@ -1930,6 +2067,61 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
             }
         }
     }
+
+    if mesh.els_enabled && !mesh.els_points.is_empty() {
+        let glow_radius = ((w.min(h) as f32) * 0.014).clamp(5.0, 18.0);
+        let core_radius = (glow_radius * 0.28).max(2.0);
+        for light in &mesh.els_points {
+            if mesh.els_flash && light.bank != mesh.els_flash_on {
+                continue;
+            }
+            let v = light.position;
+            let x = v[0] - ctr[0];
+            let y = v[1] - ctr[1];
+            let z = v[2] - ctr[2];
+            let x1 = x * cy - y * sy;
+            let y1 = x * sy + y * cy;
+            let y2 = -y1 * cp + z * sp;
+            let z2 = z * cp + y1 * sp;
+            let persp = 1.0 / (1.0 - (y2 * persp_k).clamp(-0.65, 0.65));
+            let sx = cx + x1 * scale * persp;
+            let sy = cy_s - z2 * scale * persp;
+            if sx < -glow_radius || sy < -glow_radius || sx >= wf + glow_radius || sy >= hf + glow_radius {
+                continue;
+            }
+            let center_x = sx.clamp(0.0, wf - 1.0) as usize;
+            let center_y = sy.clamp(0.0, hf - 1.0) as usize;
+            let center_depth = mesh.z_buf[center_y * w + center_x];
+            if center_depth.is_finite() && y2 < center_depth - mesh.radius * 0.08 {
+                continue;
+            }
+            let color = if light.bank {
+                Color32::from_rgb(45, 115, 255)
+            } else {
+                Color32::from_rgb(255, 35, 28)
+            };
+            let x0 = (sx - glow_radius).floor().max(0.0) as usize;
+            let x1 = (sx + glow_radius).ceil().min(wf - 1.0) as usize;
+            let y0 = (sy - glow_radius).floor().max(0.0) as usize;
+            let y1 = (sy + glow_radius).ceil().min(hf - 1.0) as usize;
+            for py in y0..=y1 {
+                for px in x0..=x1 {
+                    let dx = px as f32 + 0.5 - sx;
+                    let dy = py as f32 + 0.5 - sy;
+                    let distance = (dx * dx + dy * dy).sqrt();
+                    if distance <= glow_radius {
+                        let strength = if distance <= core_radius {
+                            1.0
+                        } else {
+                            let t = 1.0 - (distance - core_radius) / (glow_radius - core_radius);
+                            t * t * 0.42
+                        };
+                        add_preview_pixel(&mut mesh.color_buf[py * w + px], color, strength);
+                    }
+                }
+            }
+        }
+    }
 }
 
 // dropdown that switches individual material textures of the mesh on and off
@@ -2095,6 +2287,26 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
                 mesh.dirty = true;
             }
         }
+        if mesh.has_els {
+            ui.add_space(4.0);
+            let label = if mesh.els_enabled { "ELS On" } else { "ELS Off" };
+            if ui
+                .selectable_label(mesh.els_enabled, label)
+                .on_hover_text(format!("Preview {} RAGE 9 siren-bone emitters.", mesh.els_points.len()))
+                .clicked()
+            {
+                mesh.els_enabled = !mesh.els_enabled;
+                mesh.shade_mode = ShadeMode::Textured;
+                mesh.dirty = true;
+            }
+            if ui
+                .add_enabled(mesh.els_enabled, egui::Checkbox::new(&mut mesh.els_flash, "Flash"))
+                .on_hover_text("Alternate the red/blue siren emitter banks.")
+                .changed()
+            {
+                mesh.dirty = true;
+            }
+        }
         ui.label(RichText::new(&mesh.tex_status).size(11.0).color(Color32::from_rgb(130, 145, 168)));
     });
     ui.add_space(4.0);
@@ -2149,6 +2361,17 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
         mesh.yaw += 0.014;
         mesh.dirty = true;
         ui.ctx().request_repaint();
+    }
+    if mesh.els_enabled && mesh.els_flash {
+        let flash_on = ((ui.input(|i| i.time) * 7.0) as u64) % 2 == 0;
+        if flash_on != mesh.els_flash_on {
+            mesh.els_flash_on = flash_on;
+            mesh.dirty = true;
+        }
+        ui.ctx().request_repaint();
+    } else if !mesh.els_flash_on {
+        mesh.els_flash_on = true;
+        mesh.dirty = true;
     }
     if mesh.last_dragging && !dragging {
         mesh.dirty = true;
@@ -2491,6 +2714,8 @@ mod dictionary_decode_tests {
         let cases = [
             ("cheetah2", 74_051_276_816u64),
             ("cheetah2_hi", 74_053_521_424u64),
+            ("ambulance_hi", 71_757_271_056u64),
+            ("firetruk2_hi", 74_492_911_632u64),
             ("brickell_slod", 8_679_358_480u64),
         ];
         let out_dir = std::env::var("PERCYSTAR_RENDER_DIR").ok();
@@ -2505,10 +2730,18 @@ mod dictionary_decode_tests {
             if tag.starts_with("cheetah2") {
                 assert!(tex_mats > 0, "{tag} should resolve external TTPF textures");
                 assert!(paint_mats > 0 && m.has_paint_geom, "{tag} should detect vehicle paint geoms");
+            } else if tag == "ambulance_hi" {
+                assert_eq!(m.els_points.len(), 37, "ambulance should expose its siren1..37 bones");
+            } else if tag == "firetruk2_hi" {
+                assert!(!m.els_points.is_empty(), "firetruck should expose prefixed siren bones");
             } else {
                 assert!(tex_mats > 0, "{tag} should resolve external TTPF textures");
             }
             if let Some(ref d) = out_dir {
+                if m.has_els {
+                    m.els_enabled = true;
+                    m.els_flash = false;
+                }
                 rasterize_mesh(&mut m, 800, 600);
                 let mut rgba = Vec::with_capacity(800 * 600 * 4);
                 for c in &m.color_buf {
