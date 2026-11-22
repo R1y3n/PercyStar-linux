@@ -167,6 +167,7 @@ pub struct Mesh3D {
     pub els_enabled: bool,
     pub els_flash: bool,
     pub els_points: Vec<ElsPoint>,
+    vehicle_attach_points: Vec<(String, [f32; 3])>,
     els_flash_phase: u64,
     pub tex_status: String,
     pub center: [f32; 3],
@@ -351,6 +352,7 @@ impl Mesh3D {
             els_enabled: false,
             els_flash: true,
             els_points: Vec::new(),
+            vehicle_attach_points: Vec::new(),
             els_flash_phase: 0,
             tex_status,
             center,
@@ -413,6 +415,89 @@ impl Mesh3D {
         self.pan_x = 0.0;
         self.pan_y = 0.0;
         self.dirty = true;
+    }
+
+    // Adds an independently stored vehicle option at the same model-space
+    // origin. RAGE 9 tuning parts (bumpers, light bars, liveries, wheels, etc.)
+    // are separate fragment resources authored against the parent vehicle.
+    pub fn append_vehicle_part(&mut self, mut part: Mesh3D) {
+        let offset = if part.name.to_ascii_lowercase().starts_with("cmn_siren_roofbar1_") {
+            self.vehicle_attach_points
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("siren_roof_1"))
+                .map(|(_, position)| *position)
+                .unwrap_or([0.0; 3])
+        } else {
+            [0.0; 3]
+        };
+        if offset != [0.0; 3] {
+            for vertex in &mut part.verts {
+                for axis in 0..3 {
+                    vertex[axis] += offset[axis];
+                }
+            }
+            for light in &mut part.els_points {
+                for axis in 0..3 {
+                    light.position[axis] += offset[axis];
+                }
+            }
+            for (_, point) in &mut part.vehicle_attach_points {
+                for axis in 0..3 {
+                    point[axis] += offset[axis];
+                }
+            }
+        }
+        let vertex_base = self.verts.len() as u32;
+        let triangle_base = self.tris.len();
+        let geom_base = self.geom_materials.len() as u16;
+        let layer_base = self.tex_layers.len() as u16;
+        if self.parts.is_empty() && triangle_base > 0 {
+            self.parts.push(MeshPart {
+                name: self.name.clone(),
+                geoms: self.geom_count,
+                tris: 0..triangle_base,
+            });
+        }
+
+        self.verts.append(&mut part.verts);
+        self.uvs.append(&mut part.uvs);
+        self.normals.append(&mut part.normals);
+        self.tris.extend(part.tris.drain(..).map(|t| {
+            [t[0] + vertex_base, t[1] + vertex_base, t[2] + vertex_base]
+        }));
+        self.tri_geom.extend(part.tri_geom.drain(..).map(|g| g.saturating_add(geom_base)));
+        self.edges.extend(part.edges.drain(..).map(|(a, b)| (a + vertex_base, b + vertex_base)));
+
+        for material in &mut part.geom_materials {
+            for layer in material
+                .color_layers
+                .iter_mut()
+                .chain(&mut material.normal_layers)
+                .chain(&mut material.overlay_layers)
+            {
+                *layer = layer.saturating_add(layer_base);
+            }
+        }
+        self.geom_materials.append(&mut part.geom_materials);
+        self.tex_layers.append(&mut part.tex_layers);
+        self.els_points.append(&mut part.els_points);
+        self.vehicle_attach_points.append(&mut part.vehicle_attach_points);
+
+        let triangle_end = self.tris.len();
+        if triangle_end > triangle_base {
+            self.parts.push(MeshPart {
+                name: part.name,
+                geoms: part.geom_count,
+                tris: triangle_base..triangle_end,
+            });
+        }
+        self.geom_count += part.geom_count;
+        self.meshlet_count += part.meshlet_count;
+        self.bone_count = self.bone_count.max(part.bone_count);
+        self.has_els |= part.has_els;
+        self.active_part = None;
+        self.set_active_part(None);
+        self.apply_tex_layers();
     }
 
     // writes visible parts as obj one group per drawable and recenters isolated part
@@ -1423,10 +1508,16 @@ fn quat_rotate(q: [f32; 4], p: [f32; 3]) -> [f32; 3] {
     ]
 }
 
+fn rage9_siren_slot(name: &str) -> Option<u16> {
+    let lower = name.to_ascii_lowercase();
+    let siren_at = lower.rfind("siren")?;
+    lower[siren_at + "siren".len()..].parse::<u16>().ok()
+}
+
 // RAGE 9 vehicle ELS emitters are skeleton bones whose final token is siren<number>,
 // for example siren1, ext_front_siren2, or ext_rear_1_roof_siren1.
 // They are independent from emissiveTex, which is commonly the dashboard gauge atlas.
-fn extract_rage9_siren_points(v: &[u8]) -> Vec<ElsPoint> {
+fn extract_rage9_skeleton_points(v: &[u8]) -> (Vec<ElsPoint>, Vec<(String, [f32; 3])>) {
     let mut bases = vec![0usize];
     if v.len() >= 0x20 {
         if let Some(fo) = vptr(ru64(v, 0x18)) {
@@ -1444,6 +1535,7 @@ fn extract_rage9_siren_points(v: &[u8]) -> Vec<ElsPoint> {
         let mut world_pos = vec![[0.0; 3]; count];
         let mut world_scale = vec![[1.0; 3]; count];
         let mut out = Vec::new();
+        let mut attach_points = Vec::new();
         for i in 0..count {
             let b = bones + i * 0x50;
             let mut rot = [rf32(v, b), rf32(v, b + 4), rf32(v, b + 8), rf32(v, b + 12)];
@@ -1483,20 +1575,19 @@ fn extract_rage9_siren_points(v: &[u8]) -> Vec<ElsPoint> {
             let Some(name_off) = vptr(ru64(v, b + 0x30)) else { continue };
             let end = v[name_off..].iter().position(|&c| c == 0).map(|n| name_off + n).unwrap_or(name_off);
             let Ok(name) = std::str::from_utf8(&v[name_off..end]) else { continue };
-            let lower = name.to_ascii_lowercase();
-            let Some(siren_at) = lower.rfind("siren") else { continue };
-            let Some(number) = lower[siren_at + "siren".len()..].parse::<u16>().ok() else { continue };
+            attach_points.push((name.to_string(), world_pos[i]));
+            let Some(number) = rage9_siren_slot(name) else { continue };
             out.push(ElsPoint {
                 position: world_pos[i],
                 bank: number % 2 == 0,
                 slot: number.min(u8::MAX as u16) as u8,
             });
         }
-        if !out.is_empty() {
-            return out;
+        if !out.is_empty() || !attach_points.is_empty() {
+            return (out, attach_points);
         }
     }
-    Vec::new()
+    (Vec::new(), Vec::new())
 }
 
 pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name: &str) -> Result<Mesh3D, String> {
@@ -1615,7 +1706,9 @@ pub fn decode_rage9_model_from_rpf_lod(rpf_path: &Path, file_off: u64, fallback_
     }
     layout_parts_in_grid(&mut b.verts, &part_verts);
 
-    let els_points = if is_vehicle { extract_rage9_siren_points(&v) } else { Vec::new() };
+    // Optional vehicle fragments are often too small to pass the whole-vehicle
+    // classifier but can still carry their own siren emitter bones.
+    let (els_points, vehicle_attach_points) = extract_rage9_skeleton_points(&v);
 
     // default look applies the first color candidate of every drawn material
     for m in geom_materials.iter().filter(|m| !m.auxiliary_pass) {
@@ -1647,6 +1740,7 @@ pub fn decode_rage9_model_from_rpf_lod(rpf_path: &Path, file_off: u64, fallback_
     mesh.tex_layers = tex_layers;
     mesh.has_els = !els_points.is_empty();
     mesh.els_points = els_points;
+    mesh.vehicle_attach_points = vehicle_attach_points;
     mesh.apply_tex_layers();
     mesh.bone_count = extract_rage9_bone_count(&v);
     mesh.lod = lod;
@@ -2456,6 +2550,11 @@ mod tests {
 
     #[test]
     fn rage9_siren_uses_game_sequencers_and_sub_flashes() {
+        assert_eq!(rage9_siren_slot("siren1"), Some(1));
+        assert_eq!(rage9_siren_slot("ext_front_siren2"), Some(2));
+        assert_eq!(rage9_siren_slot("siren_bumper_r_bar4"), None);
+        assert_eq!(rage9_siren_slot("siren_roof_round_1"), None);
+        assert_eq!(rage9_siren_slot("siren_roof"), None);
         // siren1 starts with 1, siren4 with the inverse 0.
         assert!(rage9_siren_lit(1, 0));
         assert!(!rage9_siren_lit(4, 0));
@@ -2469,6 +2568,44 @@ mod tests {
         assert!(!rage9_siren_lit(9, 0));
         assert!(!rage9_siren_lit(0, 0));
         assert!(!rage9_siren_lit(21, 0));
+    }
+
+    #[test]
+    fn vehicle_parts_merge_in_parent_model_space() {
+        let mut base = Mesh3D::from_parts(
+            "car_hi".into(),
+            vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            vec![[0.0; 2]; 3],
+            vec![[0, 1, 2]],
+            vec![0],
+            vec![],
+            None,
+            String::new(),
+            1,
+            1,
+            "High".into(),
+        );
+        let mut lightbar = Mesh3D::from_parts(
+            "car_lightbar_hi".into(),
+            vec![[0.0, 0.0, 2.0], [1.0, 0.0, 2.0], [0.0, 1.0, 2.0]],
+            vec![[0.0; 2]; 3],
+            vec![[0, 1, 2]],
+            vec![0],
+            vec![],
+            None,
+            String::new(),
+            1,
+            1,
+            "High".into(),
+        );
+        lightbar.has_els = true;
+        lightbar.els_points.push(ElsPoint { position: [0.5, 0.5, 2.0], bank: false, slot: 1 });
+        base.append_vehicle_part(lightbar);
+        assert_eq!(base.verts.len(), 6);
+        assert_eq!(base.tris, vec![[0, 1, 2], [3, 4, 5]]);
+        assert_eq!(base.parts.len(), 2);
+        assert_eq!(base.els_points.len(), 1);
+        assert!(base.has_els);
     }
 
     #[test]
@@ -2746,6 +2883,29 @@ mod dictionary_decode_tests {
             let tex = crate::tex::decode_ttpf_texture(&hit.path, hit.tex_idx).expect("decode first ref");
             assert_eq!((tex.w, tex.h), (hit.w, hit.h), "{tag} {:016x}", first.hash64);
         }
+    }
+
+    #[test]
+    fn vehicle_option_fragments_compose() {
+        let Ok(rpf) = std::env::var("PERCYSTAR_LEVELS_RPF") else { return };
+        if !Path::new(&rpf).exists() {
+            return;
+        }
+        let mut car = decode_rage9_model_from_rpf(Path::new(&rpf), 73_817_919_504, "stanierg2_hi")
+            .expect("decode base vehicle");
+        let option = decode_rage9_model_from_rpf(Path::new(&rpf), 73_831_055_376, "stanierg2_siren_roofbar1_mount_01_hi")
+            .expect("decode separate roofbar mount");
+        let (verts, tris) = (car.verts.len(), car.tris.len());
+        car.append_vehicle_part(option);
+        assert!(car.verts.len() > verts && car.tris.len() > tris);
+        assert!(car.parts.iter().any(|p| p.name.contains("siren_roofbar")));
+        assert!(!car.has_els, "a mount point is not itself an emergency light");
+
+        let roofbar = decode_rage9_model_from_rpf(Path::new(&rpf), 74_963_226_640, "cmn_siren_roofbar1_02_hi")
+            .expect("decode shared roofbar");
+        car.append_vehicle_part(roofbar);
+        assert!(car.has_els && car.els_points.len() >= 12);
+        assert!(car.els_points.iter().all(|p| p.position[2] > 0.7), "roofbar emitters attach at the vehicle mount");
     }
 
     // external ttpf material resolution on vehicle paint and world slod

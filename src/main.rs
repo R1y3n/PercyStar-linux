@@ -507,6 +507,14 @@ fn lod_sibling_names(name: &str) -> Option<[String; 3]> {
     Some([format!("{base}_hi.{ext}"), format!("{base}_mid.{ext}"), format!("{base}.{ext}")])
 }
 
+fn model_file_stem(name: &str) -> String {
+    let stem = name.rsplit_once('.').map(|x| x.0).unwrap_or(name).to_ascii_lowercase();
+    stem.strip_suffix("_hi")
+        .or_else(|| stem.strip_suffix("_mid"))
+        .unwrap_or(&stem)
+        .to_string()
+}
+
 // detail file and in file lod buttons for the viewer header returns the clicked switch
 fn lod_switch_ui(ui: &mut egui::Ui, mesh: &Mesh3D, siblings: &[(&'static str, usize)], selected: Option<usize>) -> Option<LodPick> {
     let mut pick = None;
@@ -570,9 +578,18 @@ struct MediaState {
     bink_hwnd: Option<isize>,
     bink_clip: Option<PathBuf>,
     loaded_mesh: Option<Mesh3D>,
+    loaded_vehicle_parts: Vec<(usize, Mesh3D)>,
     loaded_textures: Option<Vec<DecodedTexture>>,
     // textures bound by the viewed model with a summary note the model stays loaded behind them
     loaded_model_textures: Option<(Vec<DecodedTexture>, String)>,
+}
+
+#[derive(Clone)]
+struct VehiclePartCandidate {
+    entry: usize,
+    name: String,
+    enabled: bool,
+    loading: bool,
 }
 
 #[derive(Default)]
@@ -767,6 +784,11 @@ struct Rpf9App {
     lod_pick: Option<LodPick>,
     // archive entry of the viewed model none for obj navmesh and animation previews
     model_entry: Option<usize>,
+    // Base vehicle plus independently stored tuning fragments selected by the user.
+    vehicle_base_mesh: Option<Mesh3D>,
+    vehicle_parts: Vec<VehiclePartCandidate>,
+    vehicle_part_meshes: HashMap<usize, Mesh3D>,
+    vehicle_part_filter: String,
     // textures button clicked in the viewer header applied at the start of the next frame
     tex_pick: bool,
     // shown textures belong to the viewed model so the viewer offers a way back to it
@@ -943,6 +965,10 @@ impl Rpf9App {
             lod_siblings: Vec::new(),
             lod_pick: None,
             model_entry: None,
+            vehicle_base_mesh: None,
+            vehicle_parts: Vec::new(),
+            vehicle_part_meshes: HashMap::new(),
+            vehicle_part_filter: String::new(),
             tex_pick: false,
             tex_from_model: false,
             lod_keep_cam: None,
@@ -1002,6 +1028,10 @@ impl Rpf9App {
         self.lod_siblings.clear();
         self.lod_pick = None;
         self.model_entry = None;
+        self.vehicle_base_mesh = None;
+        self.vehicle_parts.clear();
+        self.vehicle_part_meshes.clear();
+        self.vehicle_part_filter.clear();
         self.tex_pick = false;
         self.tex_from_model = false;
         self.lod_keep_cam = None;
@@ -1023,6 +1053,7 @@ impl Rpf9App {
         m.status.clear();
         m.loading = false;
         m.loaded_mesh = None;
+        m.loaded_vehicle_parts.clear();
         m.loaded_textures = None;
         m.loaded_model_textures = None;
     }
@@ -1374,6 +1405,83 @@ impl Rpf9App {
         if out.len() < 2 { Vec::new() } else { out }
     }
 
+    fn find_vehicle_parts(&self, e: &RpfEntry) -> Vec<VehiclePartCandidate> {
+        if e.kind != "VEH" {
+            return Vec::new();
+        }
+        let base = model_file_stem(&e.name);
+        let prefix = format!("{base}_");
+        let want_hi = e.name.rsplit_once('.').map(|x| x.0).unwrap_or(&e.name).to_ascii_lowercase().ends_with("_hi");
+        let st = self.state.lock().unwrap();
+        let mut by_stem: HashMap<String, (usize, bool)> = HashMap::new();
+        for (idx, part) in st.entries.iter().enumerate() {
+            if part.source_rpf != e.source_rpf || (part.kind != "MODEL" && part.kind != "VEH") {
+                continue;
+            }
+            let raw = part.name.rsplit_once('.').map(|x| x.0).unwrap_or(&part.name).to_ascii_lowercase();
+            let related = raw.starts_with(&prefix);
+            let shared_emergency = raw.starts_with("cmn_siren_");
+            if (!related && !shared_emergency)
+                || matches!(raw.as_str(), x if x == format!("{base}_hi") || x == format!("{base}_mid"))
+            {
+                continue;
+            }
+            let logical = raw.strip_suffix("_hi").or_else(|| raw.strip_suffix("_mid")).unwrap_or(&raw).to_string();
+            let detail_match = raw.ends_with("_hi") == want_hi;
+            by_stem
+                .entry(logical)
+                .and_modify(|slot| {
+                    if detail_match && !slot.1 {
+                        *slot = (idx, true);
+                    }
+                })
+                .or_insert((idx, detail_match));
+        }
+        let mut out: Vec<_> = by_stem
+            .into_values()
+            .map(|(entry, _)| VehiclePartCandidate {
+                entry,
+                name: st.entries[entry].name.clone(),
+                enabled: false,
+                loading: false,
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    fn rebuild_vehicle_parts(&mut self) {
+        let Some(mut mesh) = self.vehicle_base_mesh.clone() else { return };
+        for choice in &self.vehicle_parts {
+            if choice.enabled {
+                if let Some(part) = self.vehicle_part_meshes.get(&choice.entry) {
+                    mesh.append_vehicle_part(part.clone());
+                }
+            }
+        }
+        if let Some(current) = self.mesh3d.as_ref() {
+            (mesh.yaw, mesh.pitch, mesh.zoom, mesh.pan_x, mesh.pan_y) =
+                (current.yaw, current.pitch, current.zoom, current.pan_x, current.pan_y);
+            mesh.paint_color = current.paint_color;
+            mesh.els_enabled = current.els_enabled && mesh.has_els;
+            mesh.els_flash = current.els_flash;
+        }
+        self.mesh3d = Some(mesh);
+    }
+
+    fn spawn_vehicle_part_decode(&self, entry: usize) {
+        let Some(e) = self.state.lock().unwrap().entries.get(entry).cloned() else { return };
+        let media = Arc::clone(&self.media);
+        std::thread::spawn(move || {
+            let result = decode_rage9_model_from_rpf_lod(&e.source_rpf, e.offset, &e.name, 0);
+            let mut m = media.lock().unwrap();
+            match result {
+                Ok(mesh) => m.loaded_vehicle_parts.push((entry, mesh)),
+                Err(err) => m.status = format!("Vehicle part decode error ({}): {err}", e.name),
+            }
+        });
+    }
+
     fn spawn_model_decode(&self, e: &RpfEntry, lod: usize) {
         let media = Arc::clone(&self.media);
         {
@@ -1404,6 +1512,67 @@ impl Rpf9App {
                 }
             }
         });
+    }
+
+    fn vehicle_parts_ui(&mut self, ui: &mut egui::Ui) {
+        if self.vehicle_parts.is_empty() {
+            return;
+        }
+        let enabled = self.vehicle_parts.iter().filter(|p| p.enabled).count();
+        let mut loads = Vec::new();
+        let mut rebuild = false;
+        egui::CollapsingHeader::new(format!("Vehicle Parts ({enabled}/{})", self.vehicle_parts.len()))
+            .id_salt("vehicle_parts")
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.vehicle_part_filter)
+                            .hint_text("Filter bumpers, sirens, liveries, wheels…")
+                            .desired_width(320.0),
+                    );
+                    if ui.button("Clear selected").clicked() {
+                        for part in &mut self.vehicle_parts {
+                            part.enabled = false;
+                        }
+                        rebuild = true;
+                    }
+                });
+                let filter = self.vehicle_part_filter.trim().to_ascii_lowercase();
+                egui::ScrollArea::vertical()
+                    .id_salt("vehicle_parts_list")
+                    .max_height(180.0)
+                    .show(ui, |ui| {
+                        for part in &mut self.vehicle_parts {
+                            if !filter.is_empty() && !part.name.to_ascii_lowercase().contains(&filter) {
+                                continue;
+                            }
+                            ui.horizontal(|ui| {
+                                let changed = ui.checkbox(&mut part.enabled, &part.name).changed();
+                                if part.loading {
+                                    ui.spinner();
+                                }
+                                if changed {
+                                    if part.enabled && !self.vehicle_part_meshes.contains_key(&part.entry) {
+                                        part.loading = true;
+                                        loads.push(part.entry);
+                                    }
+                                    rebuild = true;
+                                }
+                            });
+                        }
+                    });
+                ui.label(
+                    RichText::new("Parts are separate RAGE 9 fragments and are overlaid in vehicle model space.")
+                        .size(10.5)
+                        .color(Color32::from_rgb(135, 145, 165)),
+                );
+            });
+        for entry in loads {
+            self.spawn_vehicle_part_decode(entry);
+        }
+        if rebuild {
+            self.rebuild_vehicle_parts();
+        }
     }
 
     // decoded texture viewer with zoom export and a picker strip
@@ -1574,6 +1743,7 @@ impl Rpf9App {
 
         if e.kind == "MODEL" || e.kind == "VEH" {
             self.lod_siblings = self.find_lod_siblings(&e);
+            self.vehicle_parts = self.find_vehicle_parts(&e);
             self.model_entry = Some(idx);
             self.spawn_model_decode(&e, 0);
             return;
@@ -2206,7 +2376,9 @@ impl Rpf9App {
                     });
                 } else if self.tex_from_model && !self.textures.is_empty() {
                     self.render_texture_viewer(ui);
-                } else if let Some(mesh) = self.mesh3d.as_mut() {
+                } else if self.mesh3d.is_some() {
+                    self.vehicle_parts_ui(ui);
+                    let mesh = self.mesh3d.as_mut().unwrap();
                     ui.horizontal_wrapped(|ui| {
                         ui.label(RichText::new(&mesh.name).size(15.0).strong().color(Color32::from_rgb(255, 168, 28)));
                         ui.label(
@@ -4074,7 +4246,8 @@ impl eframe::App for Rpf9App {
             self.load_model_textures();
         }
         let (media_loading, media_status) = {
-            let mut m = self.media.lock().unwrap();
+            let media = Arc::clone(&self.media);
+            let mut m = media.lock().unwrap();
             if let Some(mut mesh) = m.loaded_mesh.take() {
                 self.textures.clear();
                 self.tex_handle = None;
@@ -4085,8 +4258,25 @@ impl eframe::App for Rpf9App {
                 if let Some((lbl, _)) = self.lod_siblings.iter().find(|(_, i)| Some(*i) == self.selected) {
                     mesh.lod_label = format!("{lbl} detail file · {}", mesh.lod_label);
                 }
+                if !self.vehicle_parts.is_empty() {
+                    self.vehicle_base_mesh = Some(mesh.clone());
+                }
                 self.mesh3d = Some(mesh);
+                if self.vehicle_base_mesh.is_some() {
+                    self.rebuild_vehicle_parts();
+                }
                 self.show_3d = true;
+            }
+            let loaded_parts: Vec<_> = m.loaded_vehicle_parts.drain(..).collect();
+            let had_loaded_parts = !loaded_parts.is_empty();
+            for (entry, mesh) in loaded_parts {
+                self.vehicle_part_meshes.insert(entry, mesh);
+                if let Some(choice) = self.vehicle_parts.iter_mut().find(|p| p.entry == entry) {
+                    choice.loading = false;
+                }
+            }
+            if had_loaded_parts {
+                self.rebuild_vehicle_parts();
             }
             if let Some((texs, note)) = m.loaded_model_textures.take() {
                 self.textures = texs;
@@ -4523,7 +4713,9 @@ impl eframe::App for Rpf9App {
                 }
             } else if !self.textures.is_empty() {
                 self.render_texture_viewer(ui);
-            } else if let Some(mesh) = self.mesh3d.as_mut() {
+            } else if self.mesh3d.is_some() {
+                self.vehicle_parts_ui(ui);
+                let mesh = self.mesh3d.as_mut().unwrap();
                 let mut toggle_3d = self.show_3d;
                 ui.horizontal(|ui| {
                     if ui.selectable_label(!toggle_3d, "Info").clicked() { toggle_3d = false; }
