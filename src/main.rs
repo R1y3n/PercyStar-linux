@@ -5345,7 +5345,7 @@ fn scan_cli(args: &[String]) {
                     e.offset, e.comp_size, e.raw_size, e.tracks);
             } else {
                 println!("{:6}  {:>10}  {:>10}  {:>10}  {}",
-                    e.kind, e.comp_size, e.raw_size, fmt_size(size as usize), e.name);
+                    e.kind, e.comp_size, e.raw_size, format_size(size), e.name);
             }
             if limit > 0 && shown >= limit {
                 eprintln!("# shown {shown}/{total}+ matches (limit reached)");
