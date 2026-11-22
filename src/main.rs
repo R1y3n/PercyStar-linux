@@ -4625,7 +4625,6 @@ mod tests {
     use super::*;
 
     #[test]
-<<<<<<< HEAD
     fn model_sidebar_width_stays_stable_across_frames() {
         let ctx = egui::Context::default();
         let mut filter = String::new();
