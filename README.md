@@ -16,11 +16,14 @@ This repo keeps the original PercyStar codebase and adds the changes needed to b
 
 ## Download
 
-Linux builds are published on the [Releases](https://github.com/R1y3n/PercyStar-linux/releases) page. Download `PercyStar-linux-x64.tar.gz`, extract it, and run `./PercyStar`.
+Linux builds are published on the [Releases](https://github.com/R1y3n/PercyStar-linux/releases) page.
+
+- `PercyStar-linux-x64.tar.gz` - plain Linux x64 build (extract and run `./PercyStar`)
+- `PercyStar-linux-x86_64.AppImage` - AppImage build (mark executable and run; if FUSE is unavailable, use `--appimage-extract-and-run`)
 
 ## Build on GitHub
 
-The workflow builds on `ubuntu-22.04` and uploads `PercyStar-linux-x64.tar.gz` as an artifact. You can also run it manually from the Actions tab.
+The workflow builds on `ubuntu-22.04` and uploads both the tarball and AppImage as artifacts. You can also run it manually from the Actions tab.
 
 ## CLI scan
 

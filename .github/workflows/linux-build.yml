@@ -31,7 +31,10 @@ jobs:
             libxi-dev \
             libxcursor-dev \
             libgl1-mesa-dev \
-            libvulkan-dev
+            libvulkan-dev \
+            libfuse2 \
+            file \
+            desktop-file-utils
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -51,7 +54,7 @@ jobs:
       - name: Build (release)
         run: cargo build --release --bin PercyStar
 
-      - name: Package artifact
+      - name: Package tarball
         run: |
           mkdir -p dist
           cp target/release/PercyStar dist/PercyStar
@@ -59,9 +62,42 @@ jobs:
           cp README.md LICENSE dist/ || true
           tar -czf PercyStar-linux-x64.tar.gz -C dist .
 
-      - name: Upload artifact
+      - name: Build AppImage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          LINUXDEPLOY_OUTPUT_VERSION: linux
+        run: |
+          set -euo pipefail
+          mkdir -p AppDir/usr/bin AppDir/usr/share/applications AppDir/usr/share/icons/hicolor/256x256/apps
+          cp target/release/PercyStar AppDir/usr/bin/PercyStar
+          chmod +x AppDir/usr/bin/PercyStar
+          cp assets/logo.png AppDir/usr/share/icons/hicolor/256x256/apps/percystar.png
+          cp assets/logo.png AppDir/percystar.png
+          cat > AppDir/usr/share/applications/percystar.desktop << 'DESKTOP'
+          [Desktop Entry]
+          Type=Application
+          Name=PercyStar
+          Exec=PercyStar
+          Icon=percystar
+          Categories=Utility;Development;
+          Terminal=false
+          DESKTOP
+          cp AppDir/usr/share/applications/percystar.desktop AppDir/percystar.desktop
+
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage -O linuxdeploy.AppImage
+          wget -q https://github.com/linuxdeploy/linuxdeploy-plugin-gtk/releases/download/continuous/linuxdeploy-plugin-gtk-x86_64.AppImage -O linuxdeploy-plugin-gtk.AppImage
+          chmod +x linuxdeploy.AppImage linuxdeploy-plugin-gtk.AppImage
+          export PATH="$PWD:$PATH"
+          export DEPLOY_GTK_VERSION=3
+          ./linuxdeploy.AppImage --appdir AppDir --desktop-file AppDir/usr/share/applications/percystar.desktop --icon-file AppDir/usr/share/icons/hicolor/256x256/apps/percystar.png --plugin gtk --output appimage
+          ls -la PercyStar*.AppImage
+          mv PercyStar*.AppImage PercyStar-linux-x86_64.AppImage
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: PercyStar-linux-x64
-          path: PercyStar-linux-x64.tar.gz
+          path: |
+            PercyStar-linux-x64.tar.gz
+            PercyStar-linux-x86_64.AppImage
           if-no-files-found: error
