@@ -977,7 +977,7 @@ impl Rpf9App {
             sgd5_cached_text: (None, String::new()),
         };
         load_ui_state(&mut app);
-        spawn_update_check(Arc::clone(&app.update), cc.egui_ctx.clone());
+        // offline build: no auto update checks
         if let Some(last) = load_last_folder() {
             if last.is_dir() {
                 app.start_folder_scan(last);
@@ -1137,7 +1137,7 @@ impl Rpf9App {
             if path.file_name().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("levels.rpf")).unwrap_or(false) {
                 let _ = scan_levels_vehicle_zone(&path, Some(&state));
             }
-            match scan_single_rpf(&path, Some(&state)) {
+            match scan_single_rpf(&path, Some(&state), false) {
                 Ok((hdr, mut entries)) => {
                     let mut st = state.lock().unwrap();
                     st.header_info = hdr;
@@ -1310,7 +1310,7 @@ impl Rpf9App {
                                 let (p, sig, key) = &changed[idx];
                                 let rname = p.file_name().unwrap_or_default().to_string_lossy().into_owned();
                                 state.lock().unwrap().status = format!("Scanning [{}/{}] {}...", idx + 1, total, rname);
-                                if let Ok((_, new_entries)) = scan_single_rpf(p, None) {
+                                if let Ok((_, new_entries)) = scan_single_rpf(p, None, false) {
                                     {
                                         let mut st = state.lock().unwrap();
                                         let is_levels = rname.eq_ignore_ascii_case("levels.rpf");
@@ -3735,7 +3735,7 @@ fn scan_levels_vehicle_zone(levels_rpf: &PathBuf, live_state: Option<&Arc<Mutex<
     all_entries
 }
 
-fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>>) -> std::io::Result<(String, Vec<RpfEntry>)> {
+fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>>, low_mem: bool) -> std::io::Result<(String, Vec<RpfEntry>)> {
     if path.extension().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("ttpf")).unwrap_or(false) {
         let rname = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
         let (info, descs) = scan_ttpf_descriptors(path)
@@ -3780,8 +3780,9 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
         st.lock().unwrap().header_info = hdr_info.clone();
     }
 
-    // <=256mb: one sequential read serves both passes; larger files stream to cut peak memory
-    let whole: Option<Vec<u8>> = if sz <= 256 * 1024 * 1024 {
+    // whole-file read serves both passes; low_mem CLI uses a smaller threshold
+    let whole_limit = if low_mem { 64 * 1024 * 1024 } else { 512 * 1024 * 1024 };
+    let whole: Option<Vec<u8>> = if sz <= whole_limit {
         f.seek(SeekFrom::Start(0))?;
         let mut d = Vec::with_capacity(sz as usize);
         f.read_to_end(&mut d)?;
@@ -3828,18 +3829,9 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
         while pos + 44 <= read_n {
             if let Some(entry) = probe_rage9_page(buf, pos, read_n, off, path, &rname, &mut probe_dec, &mut probe_out) {
                 claimed.insert(entry.offset);
-                let csz = entry.comp_size.max(0x1000);
                 found.push(entry);
-                let next_page = (off + pos as u64 + csz + 0xFFF) & !0xFFF;
-                if next_page > off + read_n as u64 {
-                    off = next_page;
-                    jumped = true;
-                    need_seek = true;
-                    break;
-                } else {
-                    pos = (next_page - off) as usize;
-                    continue;
-                }
+                pos += 0x1000;
+                continue;
             }
             let tag = &buf[pos..pos + 4];
             if tag == b"ADAT" {
@@ -4179,16 +4171,7 @@ impl eframe::App for Rpf9App {
                         }
                     }
                 }
-                let upd_avail = self.update.lock().unwrap().available.clone();
-                if let Some((ref new_ver, _)) = upd_avail {
-                    let pill = egui::Button::new(
-                        RichText::new(format!("★ Update Available: v{new_ver}")).size(12.0).strong().color(Color32::BLACK),
-                    )
-                    .fill(Color32::from_rgb(255, 168, 28));
-                    if ui.add(pill).clicked() {
-                        self.update.lock().unwrap().show_modal = true;
-                    }
-                }
+                // offline build: update UI disabled
                 ui.add_space(10.0);
                 if ui.button("Open Folder...").clicked() {
                     if let Some(folder) = rfd::FileDialog::new().pick_folder() {
@@ -4590,52 +4573,7 @@ impl eframe::App for Rpf9App {
         });
         } // end Explorer tab
 
-        let (show_upd, upd_avail, upd_inst, upd_status) = {
-            let g = self.update.lock().unwrap();
-            (g.show_modal, g.available.clone(), g.installing, g.status.clone())
-        };
-        if show_upd {
-            if let Some((ref new_ver, ref rel_url)) = upd_avail {
-                let mut open = true;
-                egui::Window::new("Update Available")
-                    .open(&mut open)
-                    .collapsible(false)
-                    .resizable(false)
-                    .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-                    .show(ctx, |ui| {
-                        ui.label(RichText::new(format!("PercyStar v{new_ver} is ready!")).size(15.0).strong().color(Color32::from_rgb(255, 168, 28)));
-                        ui.label(RichText::new(format!("Installed: v{APP_VERSION}  ->  Latest: v{new_ver}")).color(Color32::from_rgb(200, 190, 220)));
-                        ui.add_space(8.0);
-                        if !upd_status.is_empty() {
-                            ui.label(RichText::new(&upd_status).color(Color32::from_rgb(255, 72, 165)));
-                            ui.add_space(4.0);
-                        }
-                        ui.horizontal(|ui| {
-                            let btn = egui::Button::new(
-                                RichText::new(if upd_inst { "Updating..." } else { "Download & Install" }).strong().color(Color32::BLACK),
-                            )
-                            .fill(Color32::from_rgb(255, 168, 28));
-                            // releases ship a Win64 zip only; other platforms just get "View Release"
-                            if cfg!(windows) && ui.add_enabled(!upd_inst, btn).clicked() {
-                                spawn_install_update(new_ver.clone(), Arc::clone(&self.update), ctx.clone());
-                            }
-                            if ui.button("View Release").clicked() {
-                                let _ = if cfg!(windows) {
-                                    silent_cmd("cmd").args(["/C", "start", "", rel_url]).spawn()
-                                } else {
-                                    Command::new("open").arg(rel_url).spawn()
-                                };
-                            }
-                            if ui.add_enabled(!upd_inst, egui::Button::new("Later")).clicked() {
-                                self.update.lock().unwrap().show_modal = false;
-                            }
-                        });
-                    });
-                if !open {
-                    self.update.lock().unwrap().show_modal = false;
-                }
-            }
-        }
+        // offline build: update modal disabled
     }
 }
 
@@ -4913,7 +4851,7 @@ mod tests {
         let src = PathBuf::from(src);
         let _ = fs::create_dir_all(&out);
         let t = Instant::now();
-        let (_, entries) = scan_single_rpf(&src, None).unwrap();
+        let (_, entries) = scan_single_rpf(&src, None, false).unwrap();
         let txds: Vec<_> = entries.iter().filter(|e| e.kind == "TXD").collect();
         eprintln!("{} TXD in {:.1}s", txds.len(), t.elapsed().as_secs_f32());
         let (mut ok, mut fail) = (0, 0);
@@ -5024,7 +4962,7 @@ mod tests {
         // 2. TXD native scan + decode from textures.rpf
         let tex_rpf = base.join("textures.rpf");
         if tex_rpf.exists() {
-            let (_, entries) = scan_single_rpf(&tex_rpf, None).expect("scan textures.rpf");
+            let (_, entries) = scan_single_rpf(&tex_rpf, None, false).expect("scan textures.rpf");
             let txds: Vec<&RpfEntry> = entries.iter().filter(|e| e.kind == "TXD").collect();
             assert!(!txds.is_empty(), "textures.rpf should yield TXD entries");
             let t0 = decode_txd_from_rpf(&tex_rpf, txds[0].offset).expect("decode first TXD");
@@ -5066,7 +5004,7 @@ fn export_models_cli(rpf_path: &PathBuf, out_dir: &PathBuf, filter: &str, vehicl
     let entries = if vehicles_only {
         scan_levels_vehicle_zone(rpf_path, None)
     } else {
-        match scan_single_rpf(rpf_path, None) {
+        match scan_single_rpf(rpf_path, None, false) {
             Ok((_, e)) => e,
             Err(err) => {
                 eprintln!("Scan failed: {err}");
@@ -5136,7 +5074,7 @@ fn dump_textures_cli(src_path: &PathBuf, out_dir: &PathBuf, limit: usize) {
             }
         }
     } else {
-        let entries = match scan_single_rpf(src_path, None) {
+        let entries = match scan_single_rpf(src_path, None, false) {
             Ok((_, e)) => e,
             Err(err) => { eprintln!("Scan failed: {err}"); return; }
         };
@@ -5321,6 +5259,103 @@ fn disassemble_dxbc_cli(src: &Path, output: Option<&PathBuf>) {
     }
 }
 
+fn parse_size_bytes(s: &str) -> Option<u64> {
+    let t = s.trim().to_ascii_lowercase();
+    let (num, mul) = if let Some(n) = t.strip_suffix("kb") {
+        (n, 1024u64)
+    } else if let Some(n) = t.strip_suffix("mb") {
+        (n, 1024u64 * 1024)
+    } else if let Some(n) = t.strip_suffix("gb") {
+        (n, 1024u64 * 1024 * 1024)
+    } else if let Some(n) = t.strip_suffix('b') {
+        (n, 1u64)
+    } else {
+        (t.as_str(), 1u64)
+    };
+    num.trim().parse::<u64>().ok().map(|n| n.saturating_mul(mul))
+}
+
+fn scan_cli(args: &[String]) {
+    if args.is_empty() {
+        eprintln!("Usage: PercyStar --scan <path> [--name PAT] [--type KIND] [--min-size N] [--max-size N] [--limit N] [--json]");
+        std::process::exit(2);
+    }
+    let path = PathBuf::from(&args[0]);
+    let mut name_pat: Option<String> = None;
+    let mut type_pat: Option<String> = None;
+    let mut min_size: Option<u64> = None;
+    let mut max_size: Option<u64> = None;
+    let mut limit: usize = 0;
+    let mut json = false;
+    let mut i = 1usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--name" => { i += 1; if i < args.len() { name_pat = Some(args[i].to_ascii_lowercase()); } }
+            "--type" => { i += 1; if i < args.len() { type_pat = Some(args[i].to_ascii_lowercase()); } }
+            "--min-size" => { i += 1; if i < args.len() { min_size = parse_size_bytes(&args[i]); } }
+            "--max-size" => { i += 1; if i < args.len() { max_size = parse_size_bytes(&args[i]); } }
+            "--limit" => { i += 1; if i < args.len() { limit = args[i].parse().unwrap_or(0); } }
+            "--json" => json = true,
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let mut rpfs = Vec::new();
+    if path.is_dir() {
+        collect_rpfs(&path, &mut rpfs);
+    } else {
+        rpfs.push(path.clone());
+    }
+    if rpfs.is_empty() {
+        eprintln!("No .rpf/.ttpf files found in {}", path.display());
+        std::process::exit(1);
+    }
+
+    let mut shown: usize = 0;
+    let mut total: usize = 0;
+    for rpf in &rpfs {
+        let (info, entries) = match scan_single_rpf(rpf, None, true) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("scan error {}: {e}", rpf.display());
+                continue;
+            }
+        };
+        if !json && shown == 0 {
+            eprintln!("# {} ({})", rpf.display(), info);
+        }
+        for e in entries {
+            total += 1;
+            let size = e.raw_size.max(e.comp_size);
+            if let Some(ref pat) = name_pat {
+                if !e.name.to_ascii_lowercase().contains(pat) { continue; }
+            }
+            if let Some(ref tp) = type_pat {
+                if e.kind.to_ascii_lowercase() != *tp { continue; }
+            }
+            if let Some(min) = min_size { if size < min { continue; } }
+            if let Some(max) = max_size { if size > max { continue; } }
+            shown += 1;
+            if json {
+                println!("{{\"kind\":\"{}\",\"name\":\"{}\",\"source\":\"{}\",\"rpf\":\"{}\",\"offset\":{},\"comp_size\":{},\"raw_size\":{},\"tracks\":{}}}",
+                    e.kind, e.name.replace('\\', "\\\\").replace('"', "\\\""),
+                    e.source_rpf.display().to_string().replace('\\', "\\\\").replace('"', "\\\""),
+                    e.rpf_name.replace('\\', "\\\\").replace('"', "\\\""),
+                    e.offset, e.comp_size, e.raw_size, e.tracks);
+            } else {
+                println!("{:6}  {:>10}  {:>10}  {:>10}  {}",
+                    e.kind, e.comp_size, e.raw_size, fmt_size(size as usize), e.name);
+            }
+            if limit > 0 && shown >= limit {
+                eprintln!("# shown {shown}/{total}+ matches (limit reached)");
+                return;
+            }
+        }
+    }
+    eprintln!("# shown {shown}/{total} matches across {} file(s)", rpfs.len());
+}
+
 fn main() -> eframe::Result<()> {
     // remove leftover old exe from previous self update
     if let Ok(cur) = std::env::current_exe() {
@@ -5439,6 +5474,10 @@ fn main() -> eframe::Result<()> {
     if args.len() >= 4 && args[1] == "--extract-models" {
         let filt = args.get(4).map(|s| s.as_str()).unwrap_or("");
         export_models_cli(&PathBuf::from(&args[2]), &PathBuf::from(&args[3]), filt, false);
+        return Ok(());
+    }
+    if args.len() >= 3 && args[1] == "--scan" {
+        scan_cli(&args[2..]);
         return Ok(());
     }
 
