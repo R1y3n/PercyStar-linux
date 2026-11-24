@@ -137,6 +137,12 @@ pub struct PsinDocument {
     pub instances: Vec<PsinDecodedInstance>,
 }
 
+// puts the built in names into the shared name table
+pub fn seed_names() {
+    crate::names::add(KNOWN_NAMES.iter());
+    crate::names::seed();
+}
+
 pub fn joaat(s: &str) -> u32 {
     let mut h = 0u32;
     for &b in s.as_bytes() {
@@ -164,6 +170,8 @@ fn known_joaat_map() -> &'static HashMap<u32, &'static str> {
 fn fmt_hash(h: u32) -> String {
     if let Some(&name) = known_joaat_map().get(&h) {
         format!("{name} (0x{h:08x})")
+    } else if let Some(name) = crate::names::lookup(h) {
+        format!("{name} (0x{h:08x})")
     } else {
         format!("0x{h:08x}")
     }
@@ -177,7 +185,7 @@ fn rd64(d: &[u8], o: usize) -> u64 {
     u64::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3], d[o + 4], d[o + 5], d[o + 6], d[o + 7]])
 }
 
-fn parse_iff_chunks(data: &[u8]) -> Vec<(&[u8], &[u8])> {
+pub(crate) fn parse_iff_chunks(data: &[u8]) -> Vec<(&[u8], &[u8])> {
     let mut chunks = Vec::new();
     let mut pos = 0usize;
     while pos + 8 <= data.len() {
@@ -192,10 +200,10 @@ fn parse_iff_chunks(data: &[u8]) -> Vec<(&[u8], &[u8])> {
     chunks
 }
 
-fn parse_lsch(lsch: &[u8]) -> Vec<PsinStruct> {
+pub(crate) fn parse_lsch(lsch: &[u8]) -> Vec<PsinStruct> {
     let mut off = 0usize;
     let mut hdrs = Vec::new();
-    while off + 32 <= lsch.len() && &lsch[off + 16..off + 24] == &[0xAA; 8] {
+    while off + 32 <= lsch.len() && lsch[off + 16..off + 24] == [0xAA; 8] {
         let hash = rd32(lsch, off);
         let flags = rd32(lsch, off + 8);
         let size = rd32(lsch, off + 24);
@@ -205,7 +213,8 @@ fn parse_lsch(lsch: &[u8]) -> Vec<PsinStruct> {
     }
     let mut structs = Vec::with_capacity(hdrs.len());
     for (hash, flags, size, fcnt) in hdrs {
-        let mut fields = Vec::with_capacity(fcnt);
+        // field count is a file value never reserve more than the remaining descriptors
+        let mut fields = Vec::with_capacity(fcnt.min(lsch.len().saturating_sub(off) / 16));
         for _ in 0..fcnt {
             if off + 16 > lsch.len() {
                 break;
@@ -223,10 +232,10 @@ fn parse_lsch(lsch: &[u8]) -> Vec<PsinStruct> {
     structs
 }
 
-fn parse_lenm(lenm: &[u8]) -> Vec<PsinEnum> {
+pub(crate) fn parse_lenm(lenm: &[u8]) -> Vec<PsinEnum> {
     let mut enums = Vec::new();
     let mut off = 0usize;
-    while off + 24 <= lenm.len() && &lenm[off + 8..off + 16] == &[0xEE; 8] {
+    while off + 24 <= lenm.len() && lenm[off + 8..off + 16] == [0xEE; 8] {
         let hash = rd32(lenm, off);
         let cnt = rd32(lenm, off + 16) as usize;
         off += 24;
@@ -248,7 +257,7 @@ fn parse_lenm(lenm: &[u8]) -> Vec<PsinEnum> {
 fn parse_lrsc(lrsc: &[u8], inst_count: usize, payload_len: usize) -> Vec<PsinFixup> {
     let mut fixups = Vec::new();
     // rage9 lrsc supports 16-byte (src_off, dst_inst, dst_off, pad) or 8-byte (src_off, dst_inst) records
-    if lrsc.len() >= 16 && lrsc.len() % 16 == 0 {
+    if lrsc.len() >= 16 && lrsc.len().is_multiple_of(16) {
         let mut off = 0usize;
         while off + 16 <= lrsc.len() {
             let src_off = rd32(lrsc, off) as usize;
@@ -260,7 +269,7 @@ fn parse_lrsc(lrsc: &[u8], inst_count: usize, payload_len: usize) -> Vec<PsinFix
             off += 16;
         }
     }
-    if fixups.is_empty() && lrsc.len() >= 8 && lrsc.len() % 8 == 0 {
+    if fixups.is_empty() && lrsc.len() >= 8 && lrsc.len().is_multiple_of(8) {
         let mut off = 0usize;
         while off + 8 <= lrsc.len() {
             let src_off = rd32(lrsc, off) as usize;

@@ -163,8 +163,8 @@ impl WorldMapData {
 
     fn build_terrain_mesh_with_tex(&self, step: usize, max_tex: usize, scale: f32) -> Mesh3D {
         let step = step.max(2);
-        let gw = (self.w + step - 1) / step;
-        let gh = (self.h + step - 1) / step;
+        let gw = self.w.div_ceil(step);
+        let gh = self.h.div_ceil(step);
         let mut verts = Vec::with_capacity(gw * gh);
         let mut uvs = Vec::with_capacity(gw * gh);
         for gy in 0..gh {
@@ -224,7 +224,7 @@ impl WorldMapData {
                 ));
             }
         }
-        let tex = Some(Texture2D { w: tw, h: th, pixels: tpix });
+        let tex = Some(Texture2D::new(tw, th, tpix));
 
         let tri_geom = vec![0u16; tris.len()];
         let mut m = Mesh3D::from_parts(
@@ -270,7 +270,7 @@ pub fn load_mhiu_from_rpf(path: &Path) -> Result<WorldMapData, String> {
     while i + 16 < data.len() {
         let b0 = data[i];
         let b1 = data[i + 1];
-        if b0 == 0x78 && matches!(b1, 0x01 | 0x5e | 0x9c | 0xda) && ((b0 as u16) << 8 | b1 as u16) % 31 == 0 {
+        if b0 == 0x78 && matches!(b1, 0x01 | 0x5e | 0x9c | 0xda) && ((b0 as u16) << 8 | b1 as u16).is_multiple_of(31) {
             let mut dec = Decompress::new(true);
             let _ = dec.decompress(&data[i..data.len().min(i + 262_144)], &mut out, FlushDecompress::None);
             let olen = dec.total_out() as usize;
@@ -280,7 +280,7 @@ pub fn load_mhiu_from_rpf(path: &Path) -> Result<WorldMapData, String> {
                 while cur + 16 < data.len() {
                     let cb0 = data[cur];
                     let cb1 = data[cur + 1];
-                    if cb0 != 0x78 || !matches!(cb1, 0x01 | 0x5e | 0x9c | 0xda) || ((cb0 as u16) << 8 | cb1 as u16) % 31 != 0 {
+                    if cb0 != 0x78 || !matches!(cb1, 0x01 | 0x5e | 0x9c | 0xda) || !((cb0 as u16) << 8 | cb1 as u16).is_multiple_of(31) {
                         break;
                     }
                     let mut d = Decompress::new(true);
@@ -412,6 +412,16 @@ pub fn render_world_map_ui(
                     wm.gpu_launch = Some(rx);
                     wm.gpu_starting = true;
                     wm.status = "Starting GPU World...".into();
+                }
+                Err(e) => wm.status = e,
+            }
+        }
+        if ui.add_enabled(!wm.gpu_starting, egui::Button::new(egui::RichText::new("RF World View").strong())).on_hover_text("RageForge-inspired 3D World View with Time-of-Day presets, Water toggle (V), 700m–16km draw radius & PercyStar PBR/RT shaders").clicked() {
+            match crate::world_gpu::launch_world_gpu_process(common_rpf, levels_rpf, ctx.clone()) {
+                Ok(rx) => {
+                    wm.gpu_launch = Some(rx);
+                    wm.gpu_starting = true;
+                    wm.status = "Starting RF World View...".into();
                 }
                 Err(e) => wm.status = e,
             }

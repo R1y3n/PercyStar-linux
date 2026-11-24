@@ -3,7 +3,7 @@
 <p>
   <img src="https://img.shields.io/badge/Platform-Linux%20x64-FCC624?style=flat-square&logo=linux&logoColor=black" alt="Linux" />
   <img src="https://img.shields.io/badge/Build-GitHub%20Actions-2088FF?style=flat-square&logo=githubactions&logoColor=white" alt="GitHub Actions" />
-  <img src="https://img.shields.io/badge/Version-v1.4.3-FFA81C?style=flat-square" alt="Version" />
+  <img src="https://img.shields.io/badge/Version-v1.6.0-FFA81C?style=flat-square" alt="Version" />
   <img src="https://img.shields.io/badge/License-PercyStar%20Attribution%20(%40rpatty)-red?style=flat-square" alt="License" />
 </p>
 
@@ -11,7 +11,7 @@ Linux fork of [rpatty-dev/PercyStar](https://github.com/rpatty-dev/PercyStar). T
 
 ## Latest release
 
-- **[v1.4.2-linux](https://github.com/R1y3n/PercyStar-linux/releases/tag/v1.4.2-linux)** - Linux tarball + AppImage
+- **[v1.6.0-linux](https://github.com/R1y3n/PercyStar-linux/releases/tag/v1.6.0-linux)** - Linux tarball + AppImage (upstream v1.6.0)
 
 Download from the [Releases page](https://github.com/R1y3n/PercyStar-linux/releases).
 
@@ -24,6 +24,7 @@ Download from the [Releases page](https://github.com/R1y3n/PercyStar-linux/relea
 - RPF scan improvements: skip already-identified zlib offsets in the second pass and lower idle model-viewer RAM.
 - Scan regression fix so second-pass entries (XML/RBF0/GXT/PSIN/DAT/ZLIB/bin, etc.) are found again for <=512MB archives.
 - `--scan` CLI mode for searching archives without launching the GUI.
+- Tracks upstream v1.6.0: BCPack BC1-BC5 textures, a smooth filtered model renderer with OBJ/MTL/GLB export, GXT/PSIN tree viewers, batch audio/navmesh CLI tools, and world viewer improvements.
 
 ## Downloads
 
@@ -56,7 +57,7 @@ Options:
 
 ## Upstream sync
 
-This fork tracks upstream `rpatty-dev/PercyStar` and cherry-picks compatible code changes. Merged from upstream on this branch: audio AWC superblock fix, emergency light preview, siren sequencer patterns, selectable modular vehicle parts, vehicle configuration presets from `packs.rpf`, and AWC channel detection/version bump to 1.4.3. Upstream README-only credit changes were not copied over this fork's Linux README.
+This fork tracks upstream `rpatty-dev/PercyStar`. All upstream commits through `v1.6.0` are merged into `linux-build`; Linux-specific build, offline, scanner and CLI changes were re-applied on top. Upstream README-only changes are not copied over this Linux-focused README.
 
 ---
 
@@ -84,7 +85,18 @@ PercyStar/
 │   ├── dat.rs              # RAGE 9 audio metadata (DAT25/26/41/61) decoder
 │   ├── rsc9.rs             # RSC9 0x71717171 table & phBound AABB inspector
 │   ├── boot.rs             # PE64 bring-up & manifest inspector (--inspect-exe)
-│   ├── model3d.rs          # RAGE 9 meshlet decoder, UV/TXD parser & Z-buffer renderer
+│   ├── model3d.rs          # RAGE 9 meshlet decoder & model viewer
+│   ├── model3d/raster.rs   # Smooth-shaded software rasterizer
+│   ├── model3d/shading.rs  # Lighting, normals & material shading
+│   ├── model3d/texture.rs  # Texture sampling/filtering
+│   ├── model3d/export.rs   # OBJ + MTL + PNG and GLB export
+│   ├── bink2_container.rs  # Bink2 container parser
+│   ├── content_search.rs   # In-file text search
+│   ├── names.rs            # Hashed-name recovery
+│   ├── psin_tree.rs        # Collapsible PSIN tree view
+│   ├── psin_xml.rs         # Typed PSIN XML view/edit
+│   ├── vehicle_data.rs     # Vehicle data panel
+│   ├── bench.rs            # Benchmark helpers
 │   ├── tex.rs              # Console RDNA2 textures, TTPF, RBF0, GFx, 0DRPz & CNavMesh
 │   ├── awc.rs              # Pure-Rust ADAT (.awc) Opus -> .wav decoder
 │   ├── meta7a.rs           # 0x7a metadata parser
@@ -112,11 +124,15 @@ Binary: `target/release/PercyStar`.
 
 - **Original Creator:** [@rpatty-dev](https://github.com/rpatty-dev) (`@rpatty`)
 - **Code & Research Contributors:**
+  - [@Pokeralho](https://github.com/Pokeralho) (PR #42) — Smooth-shaded filtered 3D rasterizer, OBJ+MTL+PNG and GLB export, BC2-BC5 fixes, CLI/drag-and-drop path opening, Linux build fix, parser/updater hardening and headless viewport tests.
   - [@clayeon](https://github.com/clayeon) (PR #34) — Emergency lights with siren sequencer timing, modular fragment/roofbar composition, and `packs.rpf` `0x7a` authored vehicle configurations.
-  - [@worstgirlinamerica](https://github.com/worstgirlinamerica) (PRs #30, #31, #32, #33) — `scripts/build_linux.sh`, AWC superblock directory & stereo channel fix in `awc_extract.py`, `cfg(windows)` gating, and explicit `f32` literal fix.
+  - [@Snorps37](https://github.com/Snorps37) (PR #56, Issue #55) — GXT small-table decoding through string pool records.
+  - [@worstgirlinamerica](https://github.com/worstgirlinamerica) (PRs #30-#33, #57) — `scripts/build_linux.sh`, ADAT misaligned stream-table recovery, AWC superblock directory & stereo channel fix in `awc_extract.py`, `cfg(windows)` gating, and explicit `f32` literal fix.
   - [@Xyzstk](https://github.com/Xyzstk) (PRs #8, #29) — `SGD5` shader-group parser, `DXBC`/`FSSM` extraction, and reflection resource naming.
   - [@techfoundrynz](https://github.com/techfoundrynz) (PRs #12, #13, #21–#28) — `>4 GiB` TTPF addressing, format 99 `float3` meshlets, world-scale MHIU terrain in GPU World, north-up 2D map & heightmap alignment, Model Viewer sidebar stability, window/taskbar icons, startup feedback, and `Cargo.lock` sync.
-  - [@asm512](https://github.com/asm512) (PR #19) — In-file & sibling vehicle LOD switching (`Hi`/`Mid`/`Low`, `LOD0`–`LOD3`) and per-texture material layers + Texture Browser.
+  - [@asm512](https://github.com/asm512) (PRs #19, #43, #45, #47, #51, #52, #54) — World viewer model eviction & off-thread mesh prep, PSIN tree view, GXT text export & search, PSIN typed XML, vehicle data panel, in-file/sibling vehicle LOD switching, and stale-decode/streamer fixes.
+  - `@igvcc` (Discord) — Bink2 container parser, BCPack Row-3 base-seed fallback, and `--decode-audio` / `--decode-navmesh` batch CLI tools.
+  - [@nullbrik](https://github.com/nullbrik) ([RageForge](https://github.com/nullbrik/RageForge)) — Clean-room UX inspiration for `RF World View`.
   - [@GamingChelsea](https://github.com/GamingChelsea) (PRs #10, #18) — `audio.rpf` DAT metadata catalog & AWC auto-naming, AWC decode diagnostics, superblock stream splitting, and waveform audio player foundation.
   - [@Ahmet-Dedeler](https://github.com/Ahmet-Dedeler) ([Percy6Stars](https://github.com/Ahmet-Dedeler/Percy6Stars), PRs #6, #7, Issue #9) — macOS build & 3D viewer decoding, sorting, `RADTools.exe` fix, cutout/glass/decal blending, and licensing feedback.
   - [@paryzius](https://github.com/paryzius) ([ttpf-viewer](https://github.com/paryzius/ttpf-viewer)) — `.ttpf` reduced-mip fallback for unreadable mip 0 chunks.

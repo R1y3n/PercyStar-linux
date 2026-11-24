@@ -2,12 +2,17 @@
 mod audio_player;
 mod awc;
 mod bink2;
+mod bink2_container;
+mod content_search;
 mod boot;
 mod dat;
 mod dxbc;
 mod mapdata;
 mod meta7a;
+mod names;
 mod psin;
+mod psin_tree;
+mod psin_xml;
 mod rsc9;
 mod sgd5;
 mod world_gpu;
@@ -15,7 +20,10 @@ mod worldmap;
 mod model3d;
 mod rdna2;
 mod tex;
+mod vehicle_data;
 mod vehicle_variations;
+mod bench;
+use std::collections::HashSet;
 use model3d::{
     Mesh3D, decode_rage9_model_from_rpf, decode_rage9_model_from_rpf_lod, extract_0drpz_mesh, extract_rage9_model_name,
     has_rage9_meshlets, is_vehicle_virtual, is_zlib_head, parse_obj,
@@ -40,6 +48,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -54,7 +63,7 @@ const VEH_ZONE_OFF: u64 = 0x10b2_0000_00;
 // win32 docking + PlaySound; non-windows builds use the stubs in the other `plat` below
 #[cfg(windows)]
 mod plat {
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[link(name = "winmm")]
 extern "system" {
@@ -128,10 +137,7 @@ pub fn find_binkplay() -> PathBuf {
             candidates.push(dir.join("tools").join("binkplay.exe"));
         }
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("binkplay.exe"));
-        candidates.push(cwd.join("tools").join("binkplay.exe"));
-    }
+    // never the working directory it may be an untrusted dump folder
     if let Some(path_os) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path_os) {
             candidates.push(dir.join("binkplay.exe"));
@@ -150,12 +156,6 @@ pub fn find_binkplay() -> PathBuf {
         .into_iter()
         .find(|p| p.is_file())
         .unwrap_or_else(|| PathBuf::from(r"C:\Program Files (x86)\RADVideo\binkplay.exe"))
-}
-
-pub fn play_wav_async(path: &Path) {
-    let mut wide: Vec<u16> = path.to_string_lossy().encode_utf16().collect();
-    wide.push(0);
-    unsafe { PlaySoundW(wide.as_ptr(), 0, 0x00020000 | 0x0001); }
 }
 
 pub fn stop_wav() {
@@ -191,14 +191,6 @@ pub fn find_binkplay() -> PathBuf {
         .and_then(|p| p.parent().map(|d| d.join("binkplay")))
         .filter(|p| p.exists())
         .unwrap_or_else(|| PathBuf::from("binkplay"))
-}
-
-pub fn play_wav_async(path: &Path) {
-    stop_wav();
-    let player = if cfg!(target_os = "macos") { "afplay" } else { "aplay" };
-    if let Ok(c) = Command::new(player).arg(path).spawn() {
-        *WAV_PROC.lock().unwrap() = Some(c);
-    }
 }
 
 pub fn stop_wav() {
@@ -318,7 +310,7 @@ fn is_map_zone_prefix(p0: &str) -> bool {
 }
 
 fn match_known_stem(p0: &str, stems: &[&str]) -> bool {
-    stems.contains(&p0) || (p0.len() > 4 && stems.contains(&&p0[1..]))
+    stems.contains(&p0) || (p0.len() > 4 && p0.get(1..).is_some_and(|rest| stems.contains(&rest)))
 }
 
 fn classify_model_cat(kind: &str, name: &str) -> ModelCat {
@@ -573,6 +565,8 @@ struct ScanState {
 #[derive(Default)]
 struct MediaState {
     loading: bool,
+    // bumped whenever the selection changes so a decode that finishes late is dropped
+    job: u64,
     status: String,
     loaded_tracks: Option<(Vec<audio_player::LoadedWavTrack>, Arc<Vec<u8>>)>,
     loaded_bank_ctx: Option<audio_player::AudioBankContext>,
@@ -604,6 +598,17 @@ struct ResolvedVehicleVariation {
     unresolved: Vec<u32>,
 }
 
+// physics components of the viewed vehicle filled in by a worker thread
+#[derive(Default)]
+struct VehicleDataState {
+    // archive and file name of the model the data belongs to
+    model: Option<(PathBuf, String)>,
+    loading: bool,
+    data: Option<vehicle_data::VehicleData>,
+    // scanned vehicle model names by hash used to label parents
+    names: vehicle_data::Names,
+}
+
 #[derive(Default)]
 struct UpdateState {
     available: Option<(String, String)>,
@@ -630,6 +635,39 @@ fn parse_semver(s: &str) -> Option<(u32, u32, u32)> {
     Some((maj, min, pat))
 }
 
+// archive entry names become file names so path separators and reserved characters are neutralized
+// a name can then never leave the folder it is joined onto
+fn safe_file_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })
+        .collect();
+    let cleaned = cleaned.trim().trim_end_matches('.').to_string();
+    if cleaned.is_empty() || cleaned.chars().all(|c| c == '.') {
+        return "unnamed".into();
+    }
+    cleaned
+}
+
+// release page of a version built from the pinned repository url
+fn release_page_url(ver: &str) -> String {
+    format!("{REPO_RELEASES_URL}/tag/v{ver}")
+}
+
+// opens an https url in the default browser without going through a shell
+fn open_url(url: &str) {
+    if !url.starts_with("https://") {
+        return;
+    }
+    let _ = if cfg!(windows) {
+        silent_cmd("explorer.exe").arg(url).spawn()
+    } else if cfg!(target_os = "macos") {
+        Command::new("open").arg(url).spawn()
+    } else {
+        Command::new("xdg-open").arg(url).spawn()
+    };
+}
+
 fn silent_cmd(prog: &str) -> Command {
     #[cfg(windows)]
     {
@@ -651,7 +689,8 @@ fn spawn_update_check(upd: Arc<Mutex<UpdateState>>, ctx: egui::Context) {
     std::thread::spawn(move || {
         let (curl, null) = if cfg!(windows) { ("curl.exe", "NUL") } else { ("curl", "/dev/null") };
         let out = silent_cmd(curl)
-            .args(["-fsSL", "-o", null, "-w", "%{url_effective}", &format!("{REPO_RELEASES_URL}/latest")])
+            .args(["-fsSL", "--proto", "=https", "--proto-redir", "=https", "--max-time", "20"])
+            .args(["-o", null, "-w", "%{url_effective}", &format!("{REPO_RELEASES_URL}/latest")])
             .output();
         let mut found = None;
         if let Ok(res) = out {
@@ -660,8 +699,9 @@ fn spawn_update_check(upd: Arc<Mutex<UpdateState>>, ctx: egui::Context) {
                 if let Some((_, tag)) = eff.rsplit_once("/tag/") {
                     if let (Some(rem), Some(cur)) = (parse_semver(tag), parse_semver(APP_VERSION)) {
                         if rem > cur {
-                            let ver = tag.trim_start_matches(['v', 'V']).to_string();
-                            found = Some((ver, eff));
+                            // only the parsed numbers reach urls and file names never the raw tag text
+                            let ver = format!("{}.{}.{}", rem.0, rem.1, rem.2);
+                            found = Some((ver.clone(), release_page_url(&ver)));
                         }
                     }
                 }
@@ -687,13 +727,19 @@ fn spawn_install_update(ver: String, upd: Arc<Mutex<UpdateState>>, ctx: egui::Co
     ctx.request_repaint();
     std::thread::spawn(move || {
         let res: Result<(), String> = (|| {
+            let ver = parse_semver(&ver).map(|(a, b, c)| format!("{a}.{b}.{c}")).ok_or("bad version")?;
             let tmp = std::env::temp_dir().join("percystar_self_update");
-            let _ = fs::remove_dir_all(&tmp);
+            // a leftover binary from an earlier attempt must never be the one that gets installed
+            if tmp.exists() {
+                fs::remove_dir_all(&tmp).map_err(|e| format!("Cannot clear update folder: {e}"))?;
+            }
             fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
             let zip_p = tmp.join("update.zip");
             let dl_url = format!("{REPO_RELEASES_URL}/download/v{ver}/PercyStar_v{ver}_Win64.zip");
             let dl = silent_cmd("curl.exe")
-                .args(["-fsSL", "-o", zip_p.to_str().ok_or("bad zip path")?, &dl_url])
+                .args(["-fsSL", "--proto", "=https", "--proto-redir", "=https", "--max-time", "900", "-o"])
+                .arg(&zip_p)
+                .arg(&dl_url)
                 .output()
                 .map_err(|e| format!("curl error: {e}"))?;
             if !dl.status.success() {
@@ -705,13 +751,12 @@ fn spawn_install_update(ver: String, upd: Arc<Mutex<UpdateState>>, ctx: egui::Co
                 g.status = format!("Extracting v{ver}...");
             }
             ctx.request_repaint();
-            let ps_arg = format!(
-                "Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force",
-                zip_p.display(),
-                tmp.display()
-            );
+            // paths travel through the environment so a quote in the profile name cannot end the command
             let ex = silent_cmd("powershell")
-                .args(["-NoProfile", "-Command", &ps_arg])
+                .args(["-NoProfile", "-NonInteractive", "-Command"])
+                .arg("Expand-Archive -LiteralPath $env:PERCY_ZIP -DestinationPath $env:PERCY_DST -Force")
+                .env("PERCY_ZIP", &zip_p)
+                .env("PERCY_DST", &tmp)
                 .output()
                 .map_err(|e| format!("Expand error: {e}"))?;
             if !ex.status.success() {
@@ -728,7 +773,9 @@ fn spawn_install_update(ver: String, upd: Arc<Mutex<UpdateState>>, ctx: egui::Co
             let old_exe = cur_exe.with_extension("exe.old");
             let _ = fs::remove_file(&old_exe);
             fs::rename(&cur_exe, &old_exe).map_err(|e| format!("Rename failed: {e}"))?;
-            if let Err(e) = fs::copy(&new_exe, &cur_exe) {
+            // install the bytes that were checked not whatever is on disk by now
+            if let Err(e) = fs::write(&cur_exe, &head) {
+                let _ = fs::remove_file(&cur_exe);
                 let _ = fs::rename(&old_exe, &cur_exe);
                 return Err(format!("Replace failed: {e}"));
             }
@@ -773,8 +820,14 @@ struct Rpf9App {
     tex_sel: usize,
     tex_handle: Option<(usize, TextureHandle)>,
     tex_zoom: f32,
+    tex_channel: tex::TexChannel,
+    tex_rebuild_z: bool,
+    tex_view_key: (tex::TexChannel, bool),
     vehicles_only: bool,
     audio_named: bool,
+    multi_selected: HashSet<usize>,
+    multi_anchor: Option<usize>,
+    marquee_start: Option<egui::Pos2>,
     // cachd ui list so huge scans never re filter or clone evry fram
     view: Vec<usize>,
     view_key: Option<(u64, String, Category, String, bool, bool)>,
@@ -808,12 +861,26 @@ struct Rpf9App {
     vehicle_variations: Vec<ResolvedVehicleVariation>,
     vehicle_variation_selected: usize,
     vehicle_variation_filter: String,
+    vehicle_data: Arc<Mutex<VehicleDataState>>,
     // textures button clicked in the viewer header applied at the start of the next frame
     tex_pick: bool,
     // shown textures belong to the viewed model so the viewer offers a way back to it
     tex_from_model: bool,
     // camera yaw pitch zoom pan carried across a lod switch
     lod_keep_cam: Option<[f32; 5]>,
+    export_busy: Arc<AtomicBool>,
+    // the entry on screen is a psin file shown as xml
+    psin_selected: bool,
+    // tree view of the selected psin file and whether its xml text is shown instead
+    psin_tree: Option<psin_tree::PsinTree>,
+    psin_as_text: bool,
+    export_cancel: Arc<AtomicBool>,
+    // the search box looks inside readable files instead of at names
+    content_mode: bool,
+    content: content_search::ContentSearch,
+    content_seen_gen: u64,
+    // last edit of the search box, the content search starts once typing pauses
+    content_edit_at: Option<Instant>,
     mv_drawer_open: bool,
     mv_entries: Vec<(usize, ModelCat, String)>,
     mv_counts: [usize; 10],
@@ -928,7 +995,7 @@ fn sgd5_stage_color(stage: &str) -> Color32 {
 }
 
 impl Rpf9App {
-    fn new(cc: &eframe::CreationContext<'_>, logo_rgba: Option<(Vec<u8>, u32, u32)>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, logo_rgba: Option<(Vec<u8>, u32, u32)>, startup: Option<PathBuf>) -> Self {
         setup_style(&cc.egui_ctx);
         let logo_tex = logo_rgba.map(|(raw, w, h)| {
             let ci = ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &raw);
@@ -966,8 +1033,14 @@ impl Rpf9App {
             tex_sel: 0,
             tex_handle: None,
             tex_zoom: 1.0,
+            tex_channel: tex::TexChannel::Rgba,
+            tex_rebuild_z: false,
+            tex_view_key: (tex::TexChannel::Rgba, false),
             vehicles_only: false,
             audio_named: true,
+            multi_selected: HashSet::new(),
+            multi_anchor: None,
+            marquee_start: None,
             view: Vec::new(),
             view_key: None,
             hay: Vec::new(),
@@ -995,9 +1068,19 @@ impl Rpf9App {
             vehicle_variations: Vec::new(),
             vehicle_variation_selected: 0,
             vehicle_variation_filter: String::new(),
+            vehicle_data: Arc::default(),
             tex_pick: false,
             tex_from_model: false,
             lod_keep_cam: None,
+            export_busy: Arc::new(AtomicBool::new(false)),
+            psin_selected: false,
+            psin_tree: None,
+            psin_as_text: false,
+            export_cancel: Arc::new(AtomicBool::new(false)),
+            content_mode: false,
+            content: content_search::ContentSearch::default(),
+            content_seen_gen: 0,
+            content_edit_at: None,
             mv_drawer_open: true,
             mv_entries: Vec::new(),
             mv_counts: [0; 10],
@@ -1028,14 +1111,58 @@ impl Rpf9App {
             sgd5_selected: None,
             sgd5_cached_text: (None, String::new()),
         };
+        psin::seed_names();
+        if let Some(dir) = names_dir() {
+            names::load_dir(&dir);
+        }
         load_ui_state(&mut app);
         // offline build: no auto update checks
-        if let Some(last) = load_last_folder() {
+        // a path on the command line (open with, drag onto the exe) wins over the last folder
+        if let Some(path) = startup {
+            app.open_any_path(path);
+        } else if let Some(last) = load_last_folder() {
             if last.is_dir() {
                 app.start_folder_scan(last);
             }
         }
         app
+    }
+
+    // opens a game folder an archive an obj model or a ps09 shader cache by what the path is
+    fn open_any_path(&mut self, p: PathBuf) {
+        if p.is_dir() {
+            self.start_folder_scan(p);
+            return;
+        }
+        let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
+        if ext.eq_ignore_ascii_case("obj") {
+            self.tab = AppTab::Explorer;
+            self.open_obj_path(&p);
+        } else if ext.eq_ignore_ascii_case("ps09") {
+            self.reset_selection();
+            self.tab = AppTab::Shaders;
+            self.load_ps09_path(&p);
+        } else {
+            self.start_single_scan(p);
+        }
+    }
+
+    fn ordered_selected_indices(&self) -> Vec<usize> {
+        if self.multi_selected.is_empty() {
+            return self.selected.into_iter().collect();
+        }
+        let mut out: Vec<usize> = self
+            .view
+            .iter()
+            .copied()
+            .filter(|i| self.multi_selected.contains(i))
+            .collect();
+        if out.is_empty() {
+            if let Some(s) = self.selected {
+                out.push(s);
+            }
+        }
+        out
     }
 
     fn stop_bink_player(&mut self) {
@@ -1064,6 +1191,8 @@ impl Rpf9App {
         self.tex_pick = false;
         self.tex_from_model = false;
         self.lod_keep_cam = None;
+        self.psin_selected = false;
+        self.psin_tree = None;
         self.preview.clear();
         self.last_dock_rect = [0; 4];
         self.mesh3d = None;
@@ -1078,6 +1207,7 @@ impl Rpf9App {
         self.audio_player.clear_all();
         self.stop_bink_player();
         let mut m = self.media.lock().unwrap();
+        m.job += 1;
         m.loaded_tracks = None;
         m.status.clear();
         m.loading = false;
@@ -1129,7 +1259,7 @@ impl Rpf9App {
             .map(|e| (e.rpf_name.to_ascii_lowercase(), e.offset))
             .collect();
 
-        for (li, line) in BufReader::new(f).lines().flatten().enumerate() {
+        for (li, line) in BufReader::new(f).lines().map_while(Result::ok).enumerate() {
             if li == 0 && line.starts_with("archive,") { continue; }
             let cols: Vec<&str> = line.split(',').collect();
             if cols.len() < 4 { continue; }
@@ -1172,6 +1302,7 @@ impl Rpf9App {
     }
 
     fn bump_gen(&self) -> u64 {
+        self.content.cancel();
         let mut g = self.watch_gen.lock().unwrap();
         *g += 1;
         *g
@@ -1394,7 +1525,7 @@ impl Rpf9App {
                                     let mut c = cache_arc.lock().unwrap();
                                     c.insert(key.clone(), new_entries);
                                     let mut ls = last_save.lock().unwrap();
-                                    if ls.elapsed() > Duration::from_secs(5) {
+                                    if ls.elapsed() > Duration::from_secs(45) {
                                         save_disk_cache(&c);
                                         *ls = Instant::now();
                                     }
@@ -1682,35 +1813,30 @@ impl Rpf9App {
     }
 
     fn spawn_model_decode(&self, e: &RpfEntry, lod: usize) {
-        let media = Arc::clone(&self.media);
-        {
-            let mut m = media.lock().unwrap();
-            m.loading = true;
-            m.status = format!("Decoding RAGE9 meshlets: {}...", e.name);
-        }
         let src = e.source_rpf.clone();
         let off = e.offset;
         let nm = e.name.clone();
-        std::thread::spawn(move || {
-            match decode_rage9_model_from_rpf_lod(&src, off, &nm, lod) {
-                Ok(mut mesh) => {
-                    // the viewer also applies normal maps unless the model binds an unusually large set
-                    let normals = mesh.tex_layers.iter().filter(|l| l.kind == model3d::TexLayerKind::Normal).count();
-                    if (1..=64).contains(&normals) {
-                        mesh.set_tex_layers(|l| l.default_on || l.kind == model3d::TexLayerKind::Normal);
-                    }
-                    let mut m = media.lock().unwrap();
-                    m.loading = false;
+        spawn_media_job(
+            &self.media,
+            format!("Decoding RAGE9 meshlets: {}...", e.name),
+            true,
+            move |_| {
+                let mut mesh = decode_rage9_model_from_rpf_lod(&src, off, &nm, lod).map_err(|err| format!("Model decode error ({nm}): {err}"))?;
+                // the viewer also applies normal maps unless the model binds an unusually large set
+                let normals = mesh.tex_layers.iter().filter(|l| l.kind == model3d::TexLayerKind::Normal).count();
+                if (1..=64).contains(&normals) {
+                    mesh.set_tex_layers(|l| l.default_on || l.kind == model3d::TexLayerKind::Normal);
+                }
+                Ok(mesh)
+            },
+            |m, res| match res {
+                Ok(mesh) => {
                     m.status.clear();
                     m.loaded_mesh = Some(mesh);
                 }
-                Err(err) => {
-                    let mut m = media.lock().unwrap();
-                    m.loading = false;
-                    m.status = format!("Model decode error ({nm}): {err}");
-                }
-            }
-        });
+                Err(err) => m.status = err,
+            },
+        );
     }
 
     fn vehicle_parts_ui(&mut self, ui: &mut egui::Ui) {
@@ -1897,6 +2023,61 @@ impl Rpf9App {
         }
     }
 
+    // read only physics and handling records of the viewed vehicle from data.rpf next to its archive
+    fn vehicle_data_ui(&mut self, ui: &mut egui::Ui) {
+        let Some(index) = self.model_entry else { return };
+        let shared = Arc::clone(&self.vehicle_data);
+        let mut slot = shared.lock().unwrap_or_else(|p| p.into_inner());
+        {
+            let st = self.state.lock().unwrap();
+            let Some(model) = st.entries.get(index).filter(|entry| entry.kind == "VEH") else { return };
+            let current = slot.model.as_ref().is_some_and(|(rpf, name)| *rpf == model.source_rpf && *name == model.name);
+            if !current {
+                let names: vehicle_data::Names = st
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.kind == "VEH")
+                    .map(|entry| {
+                        let stem = model_file_stem(&entry.name);
+                        (psin::joaat(&stem), stem)
+                    })
+                    .collect();
+                let key = (model.source_rpf.clone(), model.name.clone());
+                let hash = psin::joaat(&model_file_stem(&model.name));
+                *slot = VehicleDataState { model: Some(key.clone()), loading: true, ..Default::default() };
+                let (shared, ctx) = (Arc::clone(&shared), ui.ctx().clone());
+                std::thread::spawn(move || {
+                    // a missing data.rpf or a model without an entry simply leaves the panel hidden
+                    let data = std::panic::catch_unwind(|| {
+                        let db = vehicle_data::load_from_folder(key.0.parent()?)?;
+                        db.lookup(hash, &names).map(|data| (data, names))
+                    })
+                    .ok()
+                    .flatten();
+                    let mut slot = shared.lock().unwrap_or_else(|p| p.into_inner());
+                    if slot.model.as_ref() == Some(&key) {
+                        slot.loading = false;
+                        if let Some((data, names)) = data {
+                            slot.data = Some(data);
+                            slot.names = names;
+                        }
+                    }
+                    ctx.request_repaint();
+                });
+            }
+        }
+        if slot.loading {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Reading vehicle data from data.rpf…");
+            });
+            return;
+        }
+        if let Some(data) = slot.data.as_ref() {
+            vehicle_data::panel_ui(ui, data, &slot.names);
+        }
+    }
+
     // decoded texture viewer with zoom export and a picker strip
     fn render_texture_viewer(&mut self, ui: &mut egui::Ui) {
         if self.tex_sel >= self.textures.len() {
@@ -1976,11 +2157,32 @@ impl Rpf9App {
                 });
             });
         }
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Channels:").size(11.0).color(Color32::from_rgb(150, 145, 175)));
+            for (ch, lbl) in tex::TexChannel::ALL {
+                if ui.selectable_label(self.tex_channel == ch, lbl).clicked() {
+                    self.tex_channel = ch;
+                }
+            }
+            ui.separator();
+            ui.checkbox(&mut self.tex_rebuild_z, "Normal: rebuild Z").on_hover_text(
+                "Recomputes blue Z = sqrt(1 - x^2 - y^2) from R/G for two-channel normal maps",
+            );
+        });
         ui.separator();
-        let need_upload = self.tex_handle.as_ref().map(|(idx, _)| *idx != self.tex_sel).unwrap_or(true);
+        let view_key = (self.tex_channel, self.tex_rebuild_z);
+        let need_upload = self.tex_view_key != view_key
+            || self.tex_handle.as_ref().map(|(idx, _)| *idx != self.tex_sel).unwrap_or(true);
         if need_upload {
+            self.tex_view_key = view_key;
             let cur = &self.textures[self.tex_sel];
-            let ci = ColorImage { size: [cur.w, cur.h], pixels: cur.pixels.clone() };
+            // decoded texels are straight egui wants them premultiplied
+            let pixels = if view_key == (tex::TexChannel::Rgba, false) {
+                tex::premultiplied_for_egui(&cur.pixels)
+            } else {
+                tex::channel_view(&cur.pixels, view_key.0, view_key.1)
+            };
+            let ci = ColorImage { size: [cur.w, cur.h], pixels };
             let h = ui.ctx().load_texture(format!("percystar_tex_{}", self.tex_sel), ci, TextureOptions::LINEAR);
             self.tex_handle = Some((self.tex_sel, h));
         }
@@ -1998,19 +2200,18 @@ impl Rpf9App {
     // lists and decodes every pooled texture the selected model binds in its shaders
     fn load_model_textures(&mut self) {
         let Some(e) = self.model_entry.and_then(|i| self.state.lock().unwrap().entries.get(i).cloned()) else { return };
-        let media = Arc::clone(&self.media);
-        {
-            let mut m = media.lock().unwrap();
-            m.loading = true;
-            m.status = format!("Resolving textures of {}...", e.name);
-        }
-        std::thread::spawn(move || {
-            let res = model3d::list_model_texture_refs(&e.source_rpf, e.offset).and_then(|refs| {
+        let name = e.name.clone();
+        spawn_media_job(
+            &self.media,
+            format!("Resolving textures of {}...", e.name),
+            false,
+            move |progress| {
+                let refs = model3d::list_model_texture_refs(&e.source_rpf, e.offset)?;
                 let total = refs.len();
                 let pooled: Vec<_> = refs.iter().filter(|r| r.hit.is_some()).collect();
                 let mut texs = Vec::with_capacity(pooled.len());
                 for (i, r) in pooled.iter().enumerate() {
-                    media.lock().unwrap().status = format!("Decoding textures of {} ({}/{})...", e.name, i + 1, pooled.len());
+                    progress(format!("Decoding textures of {} ({}/{})...", e.name, i + 1, pooled.len()));
                     let Some(hit) = &r.hit else { continue };
                     if let Ok(mut t) = decode_ttpf_texture(&hit.path, hit.tex_idx) {
                         let pool = hit.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -2028,17 +2229,15 @@ impl Rpf9App {
                     total - pooled.len()
                 );
                 Ok((texs, note))
-            });
-            let mut m = media.lock().unwrap();
-            m.loading = false;
-            match res {
+            },
+            move |m, res| match res {
                 Ok(v) => {
                     m.status.clear();
                     m.loaded_model_textures = Some(v);
                 }
-                Err(err) => m.status = format!("Model textures ({}): {err}", e.name),
-            }
-        });
+                Err(err) => m.status = format!("Model textures ({name}): {err}"),
+            },
+        );
     }
 
     // switches the viewed model to another detail file or in file lod level keeping the camera
@@ -2076,95 +2275,64 @@ impl Rpf9App {
         }
 
         if e.kind == "NAVM" {
-            let media = Arc::clone(&self.media);
-            {
-                let mut m = media.lock().unwrap();
-                m.loading = true;
-                m.status = format!("Decoding CNavMesh tile: {}...", e.name);
-            }
-            let src = e.source_rpf.clone();
-            let off = e.offset;
-            let nm = e.name.clone();
-            std::thread::spawn(move || {
-                match decode_navmesh_from_rpf(&src, off, &nm) {
+            let (src, off, nm) = (e.source_rpf.clone(), e.offset, e.name.clone());
+            spawn_media_job(
+                &self.media,
+                format!("Decoding CNavMesh tile: {}...", e.name),
+                true,
+                move |_| decode_navmesh_from_rpf(&src, off, &nm).map_err(|err| format!("NavMesh decode error ({nm}): {err}")),
+                |m, res| match res {
                     Ok(mesh) => {
-                        let mut m = media.lock().unwrap();
-                        m.loading = false;
                         m.status.clear();
                         m.loaded_mesh = Some(mesh);
                     }
-                    Err(err) => {
-                        let mut m = media.lock().unwrap();
-                        m.loading = false;
-                        m.status = format!("NavMesh decode error ({nm}): {err}");
-                    }
-                }
-            });
+                    Err(err) => m.status = err,
+                },
+            );
             return;
         }
 
-        if e.kind == "TXD" {
-            let media = Arc::clone(&self.media);
-            {
-                let mut m = media.lock().unwrap();
-                m.loading = true;
-                m.status = format!("Deswizzling Xbox Scarlett TXD: {}...", e.name);
-            }
-            let src = e.source_rpf.clone();
-            let off = e.offset;
-            let nm = e.name.clone();
-            std::thread::spawn(move || {
-                match decode_txd_from_rpf(&src, off) {
+        if e.kind == "TXD" || e.kind == "TTPF" {
+            let (src, off, nm) = (e.source_rpf.clone(), e.offset, e.name.clone());
+            let tidx = e.tracks as usize;
+            let is_txd = e.kind == "TXD";
+            let status = if is_txd {
+                format!("Deswizzling Xbox Scarlett TXD: {}...", e.name)
+            } else {
+                format!("Decoding RDS5/ETPF texture: {}...", e.name)
+            };
+            spawn_media_job(
+                &self.media,
+                status,
+                true,
+                move |_| {
+                    if is_txd {
+                        decode_txd_from_rpf(&src, off).map_err(|err| format!("TXD decode error ({nm}): {err}"))
+                    } else {
+                        decode_ttpf_texture(&src, tidx).map(|t| vec![t]).map_err(|err| format!("TTPF decode error ({nm}): {err}"))
+                    }
+                },
+                |m, res| match res {
                     Ok(texs) => {
-                        let mut m = media.lock().unwrap();
-                        m.loading = false;
                         m.status.clear();
                         m.loaded_textures = Some(texs);
                     }
-                    Err(err) => {
-                        let mut m = media.lock().unwrap();
-                        m.loading = false;
-                        m.status = format!("TXD decode error ({nm}): {err}");
-                    }
-                }
-            });
-            return;
-        }
-
-        if e.kind == "TTPF" {
-            let media = Arc::clone(&self.media);
-            {
-                let mut m = media.lock().unwrap();
-                m.loading = true;
-                m.status = format!("Decoding RDS5/ETPF texture: {}...", e.name);
-            }
-            let src = e.source_rpf.clone();
-            let tidx = e.tracks as usize;
-            let nm = e.name.clone();
-            std::thread::spawn(move || {
-                match decode_ttpf_texture(&src, tidx) {
-                    Ok(tex) => {
-                        let mut m = media.lock().unwrap();
-                        m.loading = false;
-                        m.status.clear();
-                        m.loaded_textures = Some(vec![tex]);
-                    }
-                    Err(err) => {
-                        let mut m = media.lock().unwrap();
-                        m.loading = false;
-                        m.status = format!("TTPF decode error ({nm}): {err}");
-                    }
-                }
-            });
+                    Err(err) => m.status = err,
+                },
+            );
             return;
         }
 
         if e.kind == "BK2" {
-            let tmp = std::env::temp_dir().join("rpf9_preview_bk2");
+            // per process folder and only our own clips are removed
+            let tmp = std::env::temp_dir().join(format!("percystar_preview_bk2_{}", std::process::id()));
             let _ = fs::create_dir_all(&tmp);
             if let Ok(rd) = fs::read_dir(&tmp) {
                 for old in rd.flatten() {
-                    let _ = fs::remove_file(old.path());
+                    let is_clip = old.file_name().to_string_lossy().starts_with("clip_") && old.path().extension().is_some_and(|x| x == "bk2");
+                    if is_clip && old.file_type().is_ok_and(|t| t.is_file()) {
+                        let _ = fs::remove_file(old.path());
+                    }
                 }
             }
             // bump seq name so windows file locks never block switching vids
@@ -2184,7 +2352,7 @@ impl Rpf9App {
             }
             let bink_path = find_binkplay();
             match Command::new(&bink_path)
-                .args([bk2_p.to_str().unwrap(), "/NoBorder", "/DrawD3D11", "/L", "/W640", "/H360"])
+                .arg(&bk2_p)
                 .spawn()
             {
                 Ok(child) => {
@@ -2213,14 +2381,23 @@ impl Rpf9App {
             } else {
                 None
             };
-            let media = Arc::clone(&self.media);
-            {
-                let mut m = media.lock().unwrap();
-                m.loading = true;
-                m.loaded_bank_ctx = bank_ctx;
-                m.status = format!("Decoding {} Opus streams...", e.name);
-            }
-            std::thread::spawn(move || decode_awc_for_player(&e, &media));
+            self.media.lock().unwrap().loaded_bank_ctx = bank_ctx;
+            spawn_media_job(
+                &self.media,
+                format!("Decoding {} Opus streams...", e.name),
+                true,
+                move |progress| Ok::<_, String>(decode_awc_for_player(&e, progress)),
+                |m, res| match res {
+                    Ok((status, tracks)) => {
+                        m.status = status;
+                        m.loaded_tracks = tracks;
+                    }
+                    Err(err) => {
+                        m.status = format!("Decoded 0 playable .wav stream(s) natively — {err}");
+                        m.loaded_tracks = None;
+                    }
+                },
+            );
         } else {
             match read_entry_bytes(&e) {
                 Ok(data) => {
@@ -2237,7 +2414,15 @@ impl Rpf9App {
                             self.preview = format_hex(&data[..data.len().min(2048)]);
                         }
                     } else if e.kind == "PSIN" {
-                        self.preview = psin::parse_psin(&data);
+                        // typed xml when the schema is readable, the plain dump otherwise
+                        match psin_xml::export_xml(&data, PSIN_PREVIEW_CHARS) {
+                            Ok(xml) => {
+                                self.preview = xml;
+                                self.psin_selected = true;
+                                self.psin_tree = psin_tree::PsinTree::new(data.clone()).ok();
+                            }
+                            Err(_) => self.preview = psin::parse_psin(&data),
+                        }
                     } else if e.kind == "ANIM" {
                         self.preview = anim::parse_anim_dict(&data);
                         let (dur, trk, seed) = anim::extract_anim_summary(&data);
@@ -2277,8 +2462,29 @@ impl Rpf9App {
         }
     }
 
+    // searches the text of every readable entry for the words in the search box
+    fn start_content_search(&mut self) {
+        self.content_edit_at = None;
+        let list: Vec<(usize, RpfEntry)> = {
+            let st = self.state.lock().unwrap();
+            st.entries.iter().enumerate().filter(|(_, e)| content_search::KINDS.contains(&e.kind)).map(|(i, e)| (i, e.clone())).collect()
+        };
+        self.content.start(&self.filter, list);
+        self.view_key = None;
+    }
+
     // throtled view rebuilder runs 4x a sec during live scans
     fn refresh_view(&mut self) {
+        if self.content_mode {
+            let (gen, running) = {
+                let h = self.content.hits();
+                (h.gen, h.running)
+            };
+            if gen != self.content_seen_gen && (!running || self.last_rebuild.elapsed() > Duration::from_millis(300)) {
+                self.content_seen_gen = gen;
+                self.view_key = None;
+            }
+        }
         let ver = self.state.lock().unwrap().ver;
         let key = (ver, self.filter.clone(), self.category.clone(), self.selected_rpf.clone(), self.vehicles_only, self.audio_named);
         if self.view_sort != self.sort_mode {
@@ -2300,7 +2506,7 @@ impl Rpf9App {
     fn rebuild_view(&mut self, key: (u64, String, Category, String, bool, bool)) {
         let st = self.state.lock().unwrap();
         if self.hay_ver != st.ver || self.hay_audio_named != self.audio_named {
-            self.hay = st.entries.iter().map(|e| format!("{}|{}|{}|{}", e.name, display_entry_name(e, false), e.rpf_name, e.kind).to_lowercase()).collect();
+            self.hay = build_hay(&st.entries);
             self.cached_rpf_names = st.rpf_names.clone();
             self.hay_ver = st.ver;
             self.hay_audio_named = self.audio_named;
@@ -2326,15 +2532,15 @@ impl Rpf9App {
         let (inc, exc): (Vec<&str>, Vec<&str>) = q.split_whitespace().partition(|t| !t.starts_with('-'));
         let exc: Vec<&str> = exc.iter().map(|t| &t[1..]).filter(|t| !t.is_empty()).collect();
         let all_rpf = self.selected_rpf == "All RPFs";
-        let mut view: Vec<usize> = st
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(i, e)| {
-                let cat_ok = match self.category {
+        let content_hits = (self.content_mode && !inc.is_empty()).then(|| self.content.hits());
+        let found = content_hits.as_ref().map(|h| &h.found);
+        let (entries, hay, category, vehicles_only, selected_rpf) = (&st.entries, &self.hay, &self.category, self.vehicles_only, &self.selected_rpf);
+        let mut view: Vec<usize> = par_filter(entries.len().min(hay.len()), |i| {
+                let e = &entries[i];
+                let cat_ok = match category {
                     Category::All => true,
                     Category::Vehicles => e.kind == "VEH",
-                    Category::Models => e.kind == "VEH" || (!self.vehicles_only && e.kind == "MODEL"),
+                    Category::Models => e.kind == "VEH" || (!vehicles_only && e.kind == "MODEL"),
                     Category::Textures => e.kind == "TXD" || e.kind == "TTPF" || e.kind == "HMAP",
                     Category::Ui => e.kind == "RBF0" || e.kind == "GFX" || e.kind == "GXT",
                     Category::NavMesh => e.kind == "NAVM",
@@ -2344,23 +2550,23 @@ impl Rpf9App {
                     Category::Resources => matches!(e.kind, "PSIN" | "ANIM" | "RSC9" | "META7A"),
                     Category::Binary => e.kind == "ZLIB",
                 };
-                let h = &self.hay[*i];
-                cat_ok
-                    && (all_rpf || e.rpf_name == self.selected_rpf)
-                    && inc.iter().all(|t| h.contains(t))
-                    && !exc.iter().any(|t| h.contains(t))
-            })
-            .map(|(i, _)| i)
-            .collect();
+                let h = &hay[i];
+                let text_ok = match found {
+                    Some(found) => found.contains_key(&i),
+                    None => inc.iter().all(|t| h.contains(t)) && !exc.iter().any(|t| h.contains(t)),
+                };
+                cat_ok && (all_rpf || e.rpf_name == *selected_rpf) && text_ok
+            });
+        drop(content_hits);
         match self.sort_mode {
             SortMode::Relevance => {
                 if let Some(first) = inc.first() {
-                    view.sort_by_key(|&i| (!self.hay[i].starts_with(first), self.hay[i].len()));
+                    view.sort_unstable_by_key(|&i| (!self.hay[i].starts_with(first), self.hay[i].len(), i));
                 }
             }
-            SortMode::SizeDesc => view.sort_by_key(|&i| std::cmp::Reverse(st.entries[i].raw_size)),
-            SortMode::SizeAsc => view.sort_by_key(|&i| st.entries[i].raw_size),
-            SortMode::Name => view.sort_by(|&a, &b| self.hay[a].cmp(&self.hay[b])),
+            SortMode::SizeDesc => view.sort_unstable_by_key(|&i| (std::cmp::Reverse(st.entries[i].raw_size), i)),
+            SortMode::SizeAsc => view.sort_unstable_by_key(|&i| (st.entries[i].raw_size, i)),
+            SortMode::Name => view.sort_unstable_by(|&a, &b| self.hay[a].cmp(&self.hay[b]).then(a.cmp(&b))),
         }
         drop(st);
         self.view = view;
@@ -2397,21 +2603,18 @@ impl Rpf9App {
         let ver = self.state.lock().unwrap().ver;
         if self.mv_ver != ver {
             let st = self.state.lock().unwrap();
-            let mut entries = Vec::new();
             let mut counts = [0usize; 10];
-            let mut video_count = 0usize;
-            for (idx, e) in st.entries.iter().enumerate() {
-                if !matches!(e.kind, "MODEL" | "VEH" | "NAVM") {
-                    video_count += usize::from(e.kind == "BK2");
-                    continue;
-                }
-                let cat = classify_model_cat(e.kind, &e.name);
-                if cat != ModelCat::NavMesh {
+            let video_count = st.entries.iter().filter(|e| e.kind == "BK2").count();
+            let models = par_filter(st.entries.len(), |i| matches!(st.entries[i].kind, "MODEL" | "VEH" | "NAVM"));
+            let entries: Vec<(usize, ModelCat, String)> = par_map(&models, |&idx| {
+                let e = &st.entries[idx];
+                (idx, classify_model_cat(e.kind, &e.name), format!("{}|{}", e.name, e.rpf_name).to_ascii_lowercase())
+            });
+            for (_, cat, _) in &entries {
+                if *cat != ModelCat::NavMesh {
                     counts[0] += 1;
                 }
-                counts[model_cat_idx(cat)] += 1;
-                let hay = format!("{}|{}", e.name, e.rpf_name).to_ascii_lowercase();
-                entries.push((idx, cat, hay));
+                counts[model_cat_idx(*cat)] += 1;
             }
             drop(st);
             self.mv_entries = entries;
@@ -2430,17 +2633,15 @@ impl Rpf9App {
         let q = key.2.to_ascii_lowercase();
         let (inc, exc): (Vec<&str>, Vec<&str>) = q.split_whitespace().partition(|t| !t.starts_with('-'));
         let exc: Vec<&str> = exc.iter().map(|t| &t[1..]).filter(|t| !t.is_empty()).collect();
-        let mut view: Vec<usize> = self
-            .mv_entries
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, cat, hay))| {
-                let cat_ok = match self.mv_cat {
+        let (mv_entries, mv_cat, hide_lods) = (&self.mv_entries, self.mv_cat, self.mv_hide_lods);
+        let mut view: Vec<usize> = par_filter(mv_entries.len(), |i| {
+                let (_, cat, hay) = &mv_entries[i];
+                let cat_ok = match mv_cat {
                     ModelCat::All => *cat != ModelCat::NavMesh,
                     other => *cat == other,
                 };
-                let lod_ok = !self.mv_hide_lods
-                    || self.mv_cat == ModelCat::NavMesh
+                let lod_ok = !hide_lods
+                    || mv_cat == ModelCat::NavMesh
                     || (!hay.contains("_slod")
                         && !hay.contains("_lod.")
                         && !hay.contains("_lod_")
@@ -2454,21 +2655,19 @@ impl Rpf9App {
                     && lod_ok
                     && inc.iter().all(|t| hay.contains(t))
                     && !exc.iter().any(|t| hay.contains(t))
-            })
-            .map(|(i, _)| i)
-            .collect();
+            });
         {
             let st = self.state.lock().unwrap();
             let size = |mi: usize| st.entries.get(self.mv_entries[mi].0).map_or(0, |e| e.raw_size);
             match self.sort_mode {
                 SortMode::Relevance => {
                     if let Some(first) = inc.first() {
-                        view.sort_by_key(|&i| (!self.mv_entries[i].2.starts_with(first), self.mv_entries[i].2.len()));
+                        view.sort_unstable_by_key(|&i| (!self.mv_entries[i].2.starts_with(first), self.mv_entries[i].2.len(), i));
                     }
                 }
-                SortMode::SizeDesc => view.sort_by_key(|&i| std::cmp::Reverse(size(i))),
-                SortMode::SizeAsc => view.sort_by_key(|&i| size(i)),
-                SortMode::Name => view.sort_by(|&a, &b| self.mv_entries[a].2.cmp(&self.mv_entries[b].2)),
+                SortMode::SizeDesc => view.sort_unstable_by_key(|&i| (std::cmp::Reverse(size(i)), i)),
+                SortMode::SizeAsc => view.sort_unstable_by_key(|&i| (size(i), i)),
+                SortMode::Name => view.sort_unstable_by(|&a, &b| self.mv_entries[a].2.cmp(&self.mv_entries[b].2).then(a.cmp(&b))),
             }
         }
         self.mv_view = view;
@@ -2705,6 +2904,7 @@ impl Rpf9App {
                 } else if self.mesh3d.is_some() {
                     self.vehicle_variations_ui(ui);
                     self.vehicle_parts_ui(ui);
+                    self.vehicle_data_ui(ui);
                     let mesh = self.mesh3d.as_mut().unwrap();
                     ui.horizontal_wrapped(|ui| {
                         ui.label(RichText::new(&mesh.name).size(15.0).strong().color(Color32::from_rgb(255, 168, 28)));
@@ -3094,7 +3294,7 @@ impl Rpf9App {
                         .enumerate()
                         .filter(|(_, shader)| {
                             self.sgd5_stage_filter
-                                .map_or(true, |stage| shader.stage == stage)
+                                .is_none_or(|stage| shader.stage == stage)
                                 && (query.is_empty()
                                     || shader.name.to_ascii_lowercase().contains(&query)
                                     || format!("0x{:016x}", shader.sga_hash).contains(&query)
@@ -3212,7 +3412,7 @@ impl Rpf9App {
                         .iter()
                         .enumerate()
                         .filter(|(_, s)| {
-                            let st_ok = self.sh_stage_filter.map_or(true, |f| s.stage == f);
+                            let st_ok = self.sh_stage_filter.is_none_or(|f| s.stage == f);
                             if !st_ok {
                                 return false;
                             }
@@ -3520,24 +3720,196 @@ impl Rpf9App {
     }
 
 
+    // export, edit and name tools for the psin file on screen
+    fn psin_tools_ui(&mut self, ui: &mut egui::Ui) {
+        let complete = !self.preview.contains(PSIN_CUT_MARK);
+        let tree = self.psin_tree.is_some() && !self.psin_as_text;
+        ui.horizontal(|ui| {
+            if self.psin_tree.is_some() {
+                ui.selectable_value(&mut self.psin_as_text, false, "Tree").on_hover_text("Blocks and fields as a collapsible tree, values are edited in place");
+                ui.selectable_value(&mut self.psin_as_text, true, "XML text").on_hover_text("The same values as one editable XML text");
+                ui.separator();
+            }
+            if ui.button("Export XML…").on_hover_text("Save the whole file as editable XML").clicked() {
+                self.psin_export_xml();
+            }
+            if tree {
+                let (edits, invalid) = self.psin_tree.as_ref().map_or((0, 0), |t| (t.edit_count(), t.invalid_edits()));
+                if ui
+                    .add_enabled(edits > 0 && invalid == 0, egui::Button::new(format!("Save {edits} edit(s)…")))
+                    .on_hover_text("Write the edited values into a patched copy of the file")
+                    .on_disabled_hover_text(if invalid > 0 { "Some edited values are not valid for their type" } else { "Nothing is edited yet" })
+                    .clicked()
+                {
+                    self.psin_save_tree();
+                }
+                if edits > 0 && ui.button("Discard edits").clicked() {
+                    if let Some(t) = self.psin_tree.as_mut() {
+                        t.clear_edits();
+                    }
+                }
+            } else if ui
+                .add_enabled(complete, egui::Button::new("Save edits shown here…"))
+                .on_hover_text("Write the values edited in the text below into a patched copy of the file")
+                .on_disabled_hover_text("The view is cut short for this file: export the XML, edit it, then use Apply XML file")
+                .clicked()
+            {
+                let xml = self.preview.clone();
+                self.psin_apply_xml(xml);
+            }
+            if ui.button("Apply XML file…").on_hover_text("Write the values of an edited XML export into a patched copy of the file").clicked() {
+                if let Some(p) = rfd::FileDialog::new().add_filter("XML", &["xml"]).pick_file() {
+                    match fs::read_to_string(&p) {
+                        Ok(xml) => self.psin_apply_xml(xml),
+                        Err(err) => self.state.lock().unwrap().status = format!("Read error: {err}"),
+                    }
+                }
+            }
+            ui.separator();
+            if ui
+                .button("Recover names")
+                .on_hover_text("Match the hashed names of every metadata file against words found in the open archives and in the names folder")
+                .clicked()
+            {
+                self.recover_names();
+            }
+            ui.label(RichText::new(format!("{} names known", names::len())).size(11.0).color(Color32::from_rgb(150, 160, 180)));
+        });
+    }
+
+    fn selected_entry(&self) -> Option<RpfEntry> {
+        self.selected.and_then(|i| self.state.lock().unwrap().entries.get(i).cloned())
+    }
+
+    fn psin_export_xml(&self) {
+        let Some(e) = self.selected_entry() else { return };
+        let stem = safe_file_name(&e.name);
+        let Some(out) = rfd::FileDialog::new().set_file_name(format!("{stem}.xml")).add_filter("XML", &["xml"]).save_file() else { return };
+        let state = Arc::clone(&self.state);
+        state.lock().unwrap().status = format!("Exporting {} as XML...", e.name);
+        std::thread::spawn(move || {
+            let res = read_entry_bytes(&e)
+                .map_err(|err| err.to_string())
+                .and_then(|data| psin_xml::export_xml(&data, 0))
+                .and_then(|xml| fs::write(&out, xml).map_err(|err| err.to_string()));
+            state.lock().unwrap().status = match res {
+                Ok(()) => format!("Saved {}", out.display()),
+                Err(err) => format!("XML export failed: {err}"),
+            };
+        });
+    }
+
+    // patches a copy of the selected file with the values in the xml and saves it where the user picks
+    fn psin_apply_xml(&self, xml: String) {
+        let Some(e) = self.selected_entry() else { return };
+        let res = read_entry_bytes(&e).map_err(|err| err.to_string()).and_then(|data| psin_xml::apply_xml(&data, &xml));
+        self.psin_save_patched(&e, res);
+    }
+
+    // saves a copy of the selected file with the edits made in the tree view
+    fn psin_save_tree(&self) {
+        let (Some(e), Some(tree)) = (self.selected_entry(), self.psin_tree.as_ref()) else { return };
+        self.psin_save_patched(&e, tree.patched());
+    }
+
+    fn psin_save_patched(&self, e: &RpfEntry, res: Result<psin_xml::Applied, String>) {
+        let status = match res {
+            Err(err) => format!("Edits not applied: {err}"),
+            Ok(done) if done.changes.is_empty() => "The values are the same as in the file, nothing to save".to_string(),
+            Ok(done) => {
+                let name = format!("{}.patched.psin", safe_file_name(e.name.trim_end_matches(".psin")));
+                match rfd::FileDialog::new().set_file_name(name).save_file() {
+                    None => "Patched copy not saved".to_string(),
+                    Some(out) => match fs::write(&out, &done.data) {
+                        Ok(()) => format!(
+                            "{} value(s) changed, first: {}. Saved {} (same size as the original, its checksum section is not updated)",
+                            done.changes.len(),
+                            done.changes[0],
+                            out.display()
+                        ),
+                        Err(err) => format!("Write error: {err}"),
+                    },
+                }
+            }
+        };
+        self.state.lock().unwrap().status = status;
+    }
+
+    // looks for the words behind hashed struct, field and enum names in the open archives
+    fn recover_names(&self) {
+        if self.export_busy.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let busy = Arc::clone(&self.export_busy);
+        let state = Arc::clone(&self.state);
+        let entries: Vec<RpfEntry> =
+            state.lock().unwrap().entries.iter().filter(|e| matches!(e.kind, "PSIN" | "XML" | "RBF0" | "DAT" | "GFX" | "ZLIB")).cloned().collect();
+        std::thread::spawn(move || {
+            let mut last_note = Instant::now();
+            let (targets, tokens) = gather_names(&entries, |n| {
+                if last_note.elapsed() > Duration::from_millis(200) {
+                    last_note = Instant::now();
+                    state.lock().unwrap().status = format!("Reading metadata {}/{}...", n + 1, entries.len());
+                }
+            });
+            state.lock().unwrap().status = format!("Matching {} words against the hashed names...", tokens.len());
+            let found = names::recover(&tokens, &targets);
+            names::add(found.exact.iter().map(|f| f.1.as_str()));
+            names::add_built(found.built.iter().map(|f| f.1.as_str()));
+            let all = targets.all();
+            let resolved = all.iter().filter(|h| names::lookup(**h).is_some()).count();
+            let note = match names_dir() {
+                Some(dir) if names::save_list(&dir, names::RECOVERED_FILE, &found.exact).is_ok() && names::save_list(&dir, names::BUILT_FILE, &found.built).is_ok() => {
+                    format!(" Saved in {}; extra word lists (.txt, one name per line) placed there are used too.", dir.display())
+                }
+                _ => String::new(),
+            };
+            state.lock().unwrap().status = format!(
+                "Names: {resolved} of {} hashed names resolved. {} found written out, {} built from word combinations and shown with a ? (about {:.0} of those are chance matches).{note}",
+                all.len(),
+                found.exact.len(),
+                found.built.len(),
+                found.built_noise
+            );
+            busy.store(false, Ordering::SeqCst);
+        });
+    }
+
     fn export_entries(&self, indices: &[usize]) {
         let Some(out_dir) = rfd::FileDialog::new().pick_folder() else { return };
         let entries: Vec<RpfEntry> = {
             let st = self.state.lock().unwrap();
             indices.iter().filter_map(|&i| st.entries.get(i).cloned()).collect()
         };
+        if self.export_busy.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.export_cancel.store(false, Ordering::SeqCst);
+        let (busy, cancel) = (Arc::clone(&self.export_busy), Arc::clone(&self.export_cancel));
+        let state = Arc::clone(&self.state);
+        let is_folder = self.is_folder;
+        std::thread::spawn(move || {
+        let total = entries.len();
         let mut ok = 0usize;
-        for e in entries {
+        let mut last_note = Instant::now();
+        for (n, e) in entries.into_iter().enumerate() {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            if last_note.elapsed() > Duration::from_millis(200) {
+                last_note = Instant::now();
+                state.lock().unwrap().status = format!("Exporting {}/{total}: {}", n + 1, e.name);
+            }
             if e.kind == "MODEL" || e.kind == "VEH" {
                 if let Ok(mesh) = decode_rage9_model_from_rpf(&e.source_rpf, e.offset, &e.name) {
-                    let fname = format!("{}.obj", e.name.replace('#', ""));
+                    let fname = format!("{}.obj", safe_file_name(&e.name.replace('#', "")));
                     if mesh.export_obj(&out_dir.join(fname)).is_ok() {
                         ok += 1;
                     }
                 }
             } else if e.kind == "NAVM" {
                 if let Ok(mesh) = decode_navmesh_from_rpf(&e.source_rpf, e.offset, &e.name) {
-                    let fname = format!("{}.obj", e.name.replace('#', ""));
+                    let fname = format!("{}.obj", safe_file_name(&e.name.replace('#', "")));
                     if mesh.export_obj(&out_dir.join(fname)).is_ok() {
                         ok += 1;
                     }
@@ -3553,27 +3925,116 @@ impl Rpf9App {
                 }
             } else if e.kind == "TTPF" {
                 if let Ok(t) = decode_ttpf_texture(&e.source_rpf, e.tracks as usize) {
-                    if export_texture_png(&t, &out_dir.join(format!("{}.png", t.name))).is_ok() {
+                    if export_texture_png(&t, &out_dir.join(format!("{}.png", safe_file_name(&t.name)))).is_ok() {
+                        ok += 1;
+                    }
+                }
+            } else if e.kind == "GXT" {
+                // text tables go out as readable utf8 text, the raw file when they do not decode
+                if let Ok(data) = read_entry_bytes(&e) {
+                    let stem = e.name.strip_suffix(".gxt").unwrap_or(&e.name);
+                    let stem = if is_folder { format!("{}_{stem}", e.rpf_name.trim_end_matches(".rpf")) } else { stem.to_string() };
+                    let written = match decode_0drpz_text(&data) {
+                        Some(txt) => fs::write(out_dir.join(safe_file_name(&format!("{stem}.txt"))), txt),
+                        None => fs::write(out_dir.join(safe_file_name(&format!("{stem}.gxt"))), &data),
+                    };
+                    if written.is_ok() {
                         ok += 1;
                     }
                 }
             } else if e.kind == "RBF0" {
                 if let Ok(data) = read_entry_bytes(&e) {
                     let xml = decode_rbf0(&data).unwrap_or_else(|| String::from_utf8_lossy(&data).into_owned());
-                    let fname = format!("{}.xml", e.name.trim_end_matches(".rbf"));
+                    let fname = format!("{}.xml", safe_file_name(e.name.trim_end_matches(".rbf")));
                     if fs::write(out_dir.join(fname), xml).is_ok() {
                         ok += 1;
                     }
                 }
             } else if let Ok(data) = read_entry_bytes(&e) {
-                let fname = if self.is_folder { format!("{}_{}", e.rpf_name.trim_end_matches(".rpf"), e.name) } else { e.name.clone() };
-                if fs::write(out_dir.join(fname), &data).is_ok() {
+                let fname = if is_folder { format!("{}_{}", e.rpf_name.trim_end_matches(".rpf"), e.name) } else { e.name.clone() };
+                if fs::write(out_dir.join(safe_file_name(&fname)), &data).is_ok() {
                     ok += 1;
                 }
             }
         }
-        self.state.lock().unwrap().status = format!("Exported {ok} file(s) to {}", out_dir.display());
+        let stopped = if cancel.load(Ordering::Relaxed) { " (cancelled)" } else { "" };
+        state.lock().unwrap().status = format!("Exported {ok} file(s) to {}{stopped}", out_dir.display());
+        busy.store(false, Ordering::SeqCst);
+        });
     }
+}
+
+// runs a selection decode off the ui thread
+// the result is dropped when a newer job started meanwhile and a panicking decoder still clears the spinner
+fn spawn_media_job<T: 'static>(
+    media: &Arc<Mutex<MediaState>>,
+    status: String,
+    fresh: bool,
+    work: impl FnOnce(&(dyn Fn(String) + Sync)) -> Result<T, String> + Send + 'static,
+    done: impl FnOnce(&mut MediaState, Result<T, String>) + Send + 'static,
+) {
+    let job = {
+        let mut m = media.lock().unwrap();
+        if fresh {
+            m.job += 1;
+        }
+        m.loading = true;
+        m.status = status;
+        m.job
+    };
+    let media = Arc::clone(media);
+    std::thread::spawn(move || {
+        let progress = |text: String| {
+            if let Ok(mut m) = media.try_lock() {
+                if m.job == job {
+                    m.status = text;
+                }
+            }
+        };
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&progress)))
+            .unwrap_or_else(|_| Err("decoder panicked".into()));
+        let mut m = media.lock().unwrap_or_else(|p| p.into_inner());
+        if m.job != job {
+            return;
+        }
+        m.loading = false;
+        done(&mut m, res);
+    });
+}
+
+// preview length of a psin shown as xml and the comment the exporter leaves when it stops there
+const PSIN_PREVIEW_CHARS: usize = 200_000;
+const PSIN_CUT_MARK: &str = "<!-- preview cut here";
+
+// hashed names of the metadata entries and every word found in the readable ones
+fn gather_names(entries: &[RpfEntry], mut progress: impl FnMut(usize)) -> (names::NameTargets, HashSet<String>) {
+    let mut targets = names::NameTargets::default();
+    let mut tokens = HashSet::new();
+    for (n, e) in entries.iter().enumerate() {
+        progress(n);
+        names::harvest_tokens(e.name.as_bytes(), &mut tokens);
+        if e.raw_size > 64 << 20 {
+            continue;
+        }
+        let Ok(data) = read_entry_bytes(e) else { continue };
+        if e.kind == "PSIN" {
+            psin_xml::collect_name_targets(&data, &mut targets);
+            psin_xml::collect_strings(&data, &mut tokens);
+        } else {
+            names::harvest_tokens(&data, &mut tokens);
+            if e.kind == "RBF0" {
+                if let Some(xml) = decode_rbf0(&data) {
+                    names::harvest_tokens(xml.as_bytes(), &mut tokens);
+                }
+            }
+        }
+    }
+    (targets, tokens)
+}
+
+// word lists for hashed names live here, one name per line in any txt file
+fn names_dir() -> Option<PathBuf> {
+    app_data_dir().map(|d| d.join("names"))
 }
 
 fn app_data_dir() -> Option<PathBuf> {
@@ -3633,81 +4094,131 @@ fn load_ui_state(app: &mut Rpf9App) {
 }
 
 fn load_disk_cache() -> HashMap<String, Vec<RpfEntry>> {
+    cache_file_path().map(|p| load_disk_cache_from(&p)).unwrap_or_default()
+}
+
+fn load_disk_cache_from(p: &Path) -> HashMap<String, Vec<RpfEntry>> {
     let mut map: HashMap<String, Vec<RpfEntry>> = HashMap::new();
-    let Some(p) = cache_file_path() else { return map };
-    let Ok(f) = File::open(p) else { return map };
-    for line in BufReader::new(f).lines().flatten() {
-        let cols: Vec<&str> = line.split('\t').collect();
-        if cols.len() < 9 { continue; }
-        let kind: &'static str = match cols[4] {
-            "VEH" => "VEH",
-            "MODEL" => "MODEL",
-            "TXD" => "TXD",
-            "TTPF" => "TTPF",
-            "RBF0" => "RBF0",
-            "GFX" => "GFX",
-            "GXT" => "GXT",
-            "NAVM" => "NAVM",
-            "BK2" => "BK2",
-            "AWC" => "AWC",
-            "XML" => "XML",
-            "DAT" => "DAT",
-            "HMAP" => "HMAP",
-            "PSIN" => "PSIN",
-            "ANIM" => "ANIM",
-            "RSC9" => "RSC9",
-            "META7A" => "META7A",
-            _ => "ZLIB",
-        };
-        // tolerate old 11 col cache rows and newer 10 col ones
-        let tracks_col = if cols.len() >= 11 { 9 } else { 8 };
-        let chunks_col = tracks_col + 1;
-        let chunks = if cols.len() > chunks_col && !cols[chunks_col].is_empty() {
-            cols[chunks_col].split(';').filter_map(|pair| {
-                let mut it = pair.split(',');
-                Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
-            }).collect()
-        } else {
-            Vec::new()
-        };
-        map.entry(cols[0].to_string()).or_default().push(RpfEntry {
-            source_rpf: PathBuf::from(cols[1]),
-            rpf_name: cols[2].to_string(),
-            name: cols[3].to_string(),
-            kind,
-            offset: cols[5].parse().unwrap_or(0),
-            comp_size: cols[6].parse().unwrap_or(0),
-            raw_size: cols[7].parse().unwrap_or(0),
-            tracks: cols[tracks_col].parse().unwrap_or(0),
-            chunks,
-        });
+    let Ok(bytes) = fs::read(p) else { return map };
+    let text = String::from_utf8_lossy(&bytes);
+    let lines: Vec<&str> = text.lines().collect();
+    for row in par_map(&lines, |l| parse_cache_row(l)).into_iter().flatten() {
+        let (key, e) = row;
+        match map.get_mut(key) {
+            Some(v) => v.push(e),
+            None => {
+                map.insert(key.to_string(), vec![e]);
+            }
+        }
     }
     map
 }
 
+fn parse_cache_row(line: &str) -> Option<(&str, RpfEntry)> {
+    let mut cols = [""; 12];
+    let mut n = 0;
+    for c in line.split('\t') {
+        if n == cols.len() {
+            break;
+        }
+        cols[n] = c;
+        n += 1;
+    }
+    if n < 9 {
+        return None;
+    }
+    let kind: &'static str = match cols[4] {
+        "VEH" => "VEH",
+        "MODEL" => "MODEL",
+        "TXD" => "TXD",
+        "TTPF" => "TTPF",
+        "RBF0" => "RBF0",
+        "GFX" => "GFX",
+        "GXT" => "GXT",
+        "NAVM" => "NAVM",
+        "BK2" => "BK2",
+        "AWC" => "AWC",
+        "XML" => "XML",
+        "DAT" => "DAT",
+        "HMAP" => "HMAP",
+        "PSIN" => "PSIN",
+        "ANIM" => "ANIM",
+        "RSC9" => "RSC9",
+        "META7A" => "META7A",
+        _ => "ZLIB",
+    };
+    // tolerate old 11 col cache rows and newer 10 col ones
+    let tracks_col = if n >= 11 { 9 } else { 8 };
+    let chunks_col = tracks_col + 1;
+    let chunks = if n > chunks_col && !cols[chunks_col].is_empty() {
+        cols[chunks_col].split(';').filter_map(|pair| {
+            let mut it = pair.split(',');
+            Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+        }).collect()
+    } else {
+        Vec::new()
+    };
+    Some((cols[0], RpfEntry {
+        source_rpf: PathBuf::from(cols[1]),
+        rpf_name: cols[2].to_string(),
+        name: cols[3].to_string(),
+        kind,
+        offset: cols[5].parse().unwrap_or(0),
+        comp_size: cols[6].parse().unwrap_or(0),
+        raw_size: cols[7].parse().unwrap_or(0),
+        tracks: cols[tracks_col].parse().unwrap_or(0),
+        chunks,
+    }))
+}
+
 // atomic write via tmp file so ctrl c never corrupts the cahce
 fn save_disk_cache(map: &HashMap<String, Vec<RpfEntry>>) {
-    let Some(p) = cache_file_path() else { return };
+    if let Some(p) = cache_file_path() {
+        save_disk_cache_to(map, &p);
+    }
+}
+
+fn save_disk_cache_to(map: &HashMap<String, Vec<RpfEntry>>, p: &Path) {
     if let Some(parent) = p.parent() {
         let _ = fs::create_dir_all(parent);
     }
     let tmp = p.with_extension("tmp");
     let Ok(f) = File::create(&tmp) else { return };
     let mut w = BufWriter::new(f);
-    for (key, entries) in map {
-        for e in entries {
-            let chunks_s: String = e.chunks.iter().map(|(a, b)| format!("{a},{b}")).collect::<Vec<_>>().join(";");
-            let _ = writeln!(
-                w,
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                key, e.source_rpf.display(), e.rpf_name, e.name, e.kind,
-                e.offset, e.comp_size, e.raw_size, e.tracks, chunks_s
-            );
-        }
-    }
-    if w.flush().is_ok() {
+    // rows are formatted on all cores in blocks then written in order
+    let rows: Vec<(&str, &RpfEntry)> = map.iter().flat_map(|(k, v)| v.iter().map(move |e| (k.as_str(), e))).collect();
+    let per = rows.len().div_ceil(std::thread::available_parallelism().map_or(1, |n| n.get())).max(8192);
+    let blocks: Vec<Vec<u8>> = std::thread::scope(|s| {
+        let parts: Vec<_> = rows
+            .chunks(per)
+            .map(|c| {
+                s.spawn(move || {
+                    let mut b = Vec::with_capacity(c.len() * 200);
+                    for (key, e) in c {
+                        let _ = write!(
+                            b,
+                            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t",
+                            key, e.source_rpf.display(), e.rpf_name, e.name, e.kind,
+                            e.offset, e.comp_size, e.raw_size, e.tracks
+                        );
+                        for (j, (a, z)) in e.chunks.iter().enumerate() {
+                            let _ = write!(b, "{}{a},{z}", if j > 0 { ";" } else { "" });
+                        }
+                        b.push(b'\n');
+                    }
+                    b
+                })
+            })
+            .collect();
+        parts.into_iter().map(|p| p.join().unwrap_or_default()).collect()
+    });
+    // a failed write must never replace the good cache with a cut one
+    if blocks.iter().all(|b| w.write_all(b).is_ok()) && w.flush().is_ok() {
         drop(w);
-        let _ = fs::rename(&tmp, &p);
+        let _ = fs::rename(&tmp, p);
+    } else {
+        drop(w);
+        let _ = fs::remove_file(&tmp);
     }
 }
 
@@ -3728,16 +4239,15 @@ fn collect_rpfs(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn decode_awc_for_player(e: &RpfEntry, media: &Arc<Mutex<MediaState>>) {
+type AwcPlayerTracks = Option<(Vec<audio_player::LoadedWavTrack>, Arc<Vec<u8>>)>;
+
+// status line and decoded tracks of one awc entry for the audio player
+fn decode_awc_for_player(e: &RpfEntry, progress: &(dyn Fn(String) + Sync)) -> (String, AwcPlayerTracks) {
     match read_entry_bytes(e) {
         Ok(bytes) => {
             let res = awc::decode_awc_bytes_in_memory(&bytes, "stream", |done, total| {
-                if let Ok(mut m) = media.try_lock() {
-                    m.status = format!("Scanning AWC waveforms ({done}/{total})...");
-                }
+                progress(format!("Scanning AWC waveforms ({done}/{total})..."));
             });
-            let mut m = media.lock().unwrap();
-            m.loading = false;
             if res.tracks.is_empty() {
                 let mut lines = vec![
                     format!("Decoded 0 playable .wav stream(s) natively — {}", res.summary),
@@ -3747,22 +4257,18 @@ fn decode_awc_for_player(e: &RpfEntry, media: &Arc<Mutex<MediaState>>) {
                     ),
                 ];
                 lines.extend(res.details);
-                m.status = lines.join("\n");
-                m.loaded_tracks = None;
+                (lines.join("\n"), None)
             } else {
-                m.status = format!("Decoded {} playable .wav stream(s) natively", res.tracks.len());
-                m.loaded_tracks = Some((res.tracks, Arc::new(bytes)));
+                (format!("Decoded {} playable .wav stream(s) natively", res.tracks.len()), Some((res.tracks, Arc::new(bytes))))
             }
         }
-        Err(err) => {
-            let mut m = media.lock().unwrap();
-            m.loading = false;
-            m.status = format!(
+        Err(err) => (
+            format!(
                 "Decoded 0 playable .wav stream(s) natively — Read error: {err}\nEntry: {} (comp={}, raw={}, offset=0x{:X}, RPF: {})",
                 e.name, e.comp_size, e.raw_size, e.offset, e.rpf_name
-            );
-            m.loaded_tracks = None;
-        }
+            ),
+            None,
+        ),
     }
 }
 
@@ -3817,6 +4323,8 @@ fn setup_style(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 
     // neon sunset theme matching dusk purple magenta and golden amber
+    // the palette is dark only so the windows light mode must not switch egui to its light style
+    ctx.set_theme(egui::Theme::Dark);
     let mut vis = egui::Visuals::dark();
     vis.panel_fill = Color32::from_rgb(18, 12, 28);
     vis.window_fill = Color32::from_rgb(24, 16, 36);
@@ -3948,6 +4456,52 @@ fn sort_combo(ui: &mut egui::Ui, id: &str, mode: &mut SortMode) {
 }
 
 // right click context menu on file rows to copy name archive path directory or hex offset
+fn format_multi_copy(entries: &[&RpfEntry], mode: u8) -> String {
+    entries
+        .iter()
+        .map(|e| match mode {
+            0 => e.name.clone(),
+            1 => format!("{} / {}", e.rpf_name, e.name),
+            _ => format!("{} @ 0x{:08x} ({})", e.rpf_name, e.offset, e.name),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn apply_multi_select(
+    view: &[usize],
+    multi: &mut HashSet<usize>,
+    anchor: &mut Option<usize>,
+    clicked_idx: usize,
+    ctrl: bool,
+    shift: bool,
+) {
+    if shift {
+        if let Some(anc) = *anchor {
+            if let (Some(a), Some(b)) = (view.iter().position(|&x| x == anc), view.iter().position(|&x| x == clicked_idx)) {
+                if !ctrl {
+                    multi.clear();
+                }
+                let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                for &idx in &view[lo..=hi] {
+                    multi.insert(idx);
+                }
+                return;
+            }
+        }
+    }
+    if ctrl {
+        if !multi.remove(&clicked_idx) {
+            multi.insert(clicked_idx);
+        }
+        *anchor = Some(clicked_idx);
+    } else {
+        multi.clear();
+        multi.insert(clicked_idx);
+        *anchor = Some(clicked_idx);
+    }
+}
+
 fn entry_context_menu(resp: &egui::Response, e: &RpfEntry) -> Option<String> {
     let mut copied = None;
     resp.context_menu(|ui| {
@@ -4221,6 +4775,67 @@ fn probe_rage9_page(
     })
 }
 
+// runs probe_rage9_page on every 4kb page of buf on all cores, slot i holds the page at i * 0x1000
+fn probe_pages(buf: &[u8], read_n: usize, off: u64, path: &Path, rname: &str) -> Vec<Option<RpfEntry>> {
+    use std::sync::atomic::AtomicUsize;
+    const PAGES_PER_JOB: usize = 64;
+    let pages = if read_n >= 44 { (read_n - 44) / 0x1000 + 1 } else { 0 };
+    let mut out: Vec<Option<RpfEntry>> = (0..pages).map(|_| None).collect();
+    let next = AtomicUsize::new(0);
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get()).min(pages.div_ceil(PAGES_PER_JOB)).max(1);
+    let found: Vec<Vec<(usize, RpfEntry)>> = std::thread::scope(|s| {
+        let workers: Vec<_> = (0..cores)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut dec = Decompress::new(true);
+                    let mut scratch = vec![0u8; 32768];
+                    let mut hits = Vec::new();
+                    loop {
+                        let job = next.fetch_add(1, Ordering::Relaxed) * PAGES_PER_JOB;
+                        if job >= pages {
+                            return hits;
+                        }
+                        for i in job..(job + PAGES_PER_JOB).min(pages) {
+                            if let Some(e) = probe_rage9_page(buf, i * 0x1000, read_n, off, path, rname, &mut dec, &mut scratch) {
+                                hits.push((i, e));
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        workers.into_iter().map(|w| w.join().unwrap_or_default()).collect()
+    });
+    for (i, e) in found.into_iter().flatten() {
+        out[i] = Some(e);
+    }
+    out
+}
+
+type ChunkReader = (std::sync::mpsc::Sender<u64>, std::sync::mpsc::Receiver<(u64, std::io::Result<Vec<u8>>)>);
+
+// reads 16mb chunks on its own thread one request ahead so the disk never waits for the probes
+// send an offset, receive (offset, bytes); an empty chunk means end of file
+fn spawn_chunk_reader(path: &Path) -> std::io::Result<ChunkReader> {
+    let mut f = File::open(path)?;
+    let (req_tx, req_rx) = std::sync::mpsc::channel::<u64>();
+    let (res_tx, res_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for at in req_rx {
+            let res = f.seek(SeekFrom::Start(at)).and_then(|_| {
+                let mut b = vec![0u8; 16 * 1024 * 1024];
+                let n = f.read(&mut b)?;
+                b.truncate(n);
+                Ok(b)
+            });
+            if res_tx.send((at, res)).is_err() {
+                return;
+            }
+        }
+    });
+    Ok((req_tx, res_rx))
+}
+
 // single 16mb sequntial stream avoids hdd seek thrash while indexing vehicles
 fn scan_levels_vehicle_zone(levels_rpf: &PathBuf, live_state: Option<&Arc<Mutex<ScanState>>>) -> Vec<RpfEntry> {
     let sz = fs::metadata(levels_rpf).map(|m| m.len()).unwrap_or(0);
@@ -4228,23 +4843,21 @@ fn scan_levels_vehicle_zone(levels_rpf: &PathBuf, live_state: Option<&Arc<Mutex<
     let total_len = sz.saturating_sub(start_off);
     if total_len == 0 { return Vec::new(); }
     let rname = levels_rpf.file_name().unwrap_or_default().to_string_lossy().into_owned();
-    let Ok(mut f) = File::open(levels_rpf) else { return Vec::new() };
-    if f.seek(SeekFrom::Start(start_off)).is_err() { return Vec::new(); }
+    let Ok((req, chunks)) = spawn_chunk_reader(levels_rpf) else { return Vec::new() };
 
     let mut all_entries: Vec<RpfEntry> = Vec::new();
     let mut local_batch: Vec<RpfEntry> = Vec::with_capacity(32);
-    let mut buf = vec![0u8; 16 * 1024 * 1024];
-    let mut probe_dec = Decompress::new(true);
-    let mut probe_out = vec![0u8; 32768];
     let mut off = start_off;
     let mut last_pct = 999u64;
+    let _ = req.send(off);
 
     while off < sz {
-        let Ok(n) = f.read(&mut buf) else { break };
+        let Ok((_, Ok(buf))) = chunks.recv() else { break };
+        let n = buf.len();
         if n == 0 { break; }
-        let mut pos = 0usize;
-        while pos + 44 <= n {
-            if let Some(entry) = probe_rage9_page(&buf, pos, n, off, levels_rpf, &rname, &mut probe_dec, &mut probe_out) {
+        let _ = req.send(off + n as u64);
+        for entry in probe_pages(&buf, n, off, levels_rpf, &rname).into_iter().flatten() {
+            {
                 local_batch.push(entry);
                 if local_batch.len() >= 15 {
                     if let Some(st) = live_state {
@@ -4252,10 +4865,9 @@ fn scan_levels_vehicle_zone(levels_rpf: &PathBuf, live_state: Option<&Arc<Mutex<
                         g.entries.extend(local_batch.iter().cloned());
                         g.ver += 1;
                     }
-                    all_entries.extend(local_batch.drain(..));
+                    all_entries.append(&mut local_batch);
                 }
             }
-            pos += 0x1000;
         }
         off += n as u64;
         if let Some(st) = live_state {
@@ -4317,7 +4929,8 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
         let start = if doff >= 0x40 && (doff as u64) < sz { doff } else { 0x40 };
         (start, format!("{magic}  ·  {sz} B  ·  {ecnt} entries  ·  data@0x{start:x}  ·  names={nlen}B"))
     } else {
-        let hdr_hex: String = hdr[4..n.min(16)].iter().map(|b| format!("{b:02x}")).collect();
+        // files shorter than the magic have nothing to show
+        let hdr_hex: String = hdr.get(4..n.min(16)).unwrap_or(&[]).iter().map(|b| format!("{b:02x}")).collect();
         (0x40usize, format!("{magic}  ·  {sz} B  ·  {hdr_hex}"))
     };
     if let Some(st) = progress_state {
@@ -4335,16 +4948,21 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
         None
     };
     let mut found = Vec::new();
-    let mut claimed: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut claimed = std::collections::HashSet::new();
     let mut off = 0u64;
-    let mut buf = if whole.is_some() { Vec::new() } else { vec![0u8; 16 * 1024 * 1024] };
     let mut probe_dec = Decompress::new(true);
     let mut probe_out = vec![0u8; 32768];
     let mut bk2_idx = 0usize;
     let mut awc_idx = 0usize;
     let mut last_ui_mb = 0u64;
-    let mut need_seek = true;
     let scan_limit = if rname.eq_ignore_ascii_case("levels.rpf") && sz > VEH_ZONE_OFF { VEH_ZONE_OFF } else { sz };
+    // a page probe reads the same bytes whatever offset the whole-file slice starts at, so one pass covers every page
+    let mut whole_pages = whole.as_ref().map(|w| probe_pages(w, w.len(), 0, path, &rname)).unwrap_or_default();
+    let reader = if whole.is_none() { Some(spawn_chunk_reader(path)?) } else { None };
+    let mut chunk: Vec<u8>;
+    if let Some((req, _)) = &reader {
+        let _ = req.send(0);
+    }
 
     while off < scan_limit {
         if let Some(st) = progress_state {
@@ -4355,23 +4973,45 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
             }
         }
         let read_n;
+        let mut chunk_pages = Vec::new();
         let buf: &[u8] = if let Some(w) = &whole {
             let s = &w[(off as usize).min(w.len())..];
             read_n = s.len();
             s
         } else {
-            if need_seek {
-                f.seek(SeekFrom::Start(off))?;
-                need_seek = false;
+            let (req, chunks) = reader.as_ref().expect("reader exists without whole");
+            loop {
+                let (at, res) = chunks.recv().map_err(|_| std::io::Error::other("reader thread stopped"))?;
+                // a read queued before a jump is stale, the jump target was requested right after it
+                if at == off {
+                    chunk = res?;
+                    break;
+                }
             }
-            read_n = f.read(&mut buf)?;
-            &buf[..read_n]
+            read_n = chunk.len();
+            if read_n > 0 {
+                let _ = req.send(off + read_n as u64);
+                chunk_pages = probe_pages(&chunk, read_n, off, path, &rname);
+            }
+            &chunk
         };
         if read_n == 0 { break; }
         let mut pos = 0usize;
         let mut jumped = false;
         while pos + 44 <= read_n {
-            if let Some(entry) = probe_rage9_page(buf, pos, read_n, off, path, &rname, &mut probe_dec, &mut probe_out) {
+            let abs = off as usize + pos;
+            let pre = if whole.is_some() && abs.is_multiple_of(0x1000) {
+                whole_pages.get_mut(abs / 0x1000).map(Option::take)
+            } else if whole.is_none() && pos.is_multiple_of(0x1000) {
+                chunk_pages.get_mut(pos / 0x1000).map(Option::take)
+            } else {
+                None
+            };
+            let probed = match pre {
+                Some(p) => p,
+                None => probe_rage9_page(buf, pos, read_n, off, path, &rname, &mut probe_dec, &mut probe_out),
+            };
+            if let Some(entry) = probed {
                 claimed.insert(entry.offset);
                 found.push(entry);
                 pos += 0x1000;
@@ -4394,7 +5034,7 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
                     tracks: sc,
                     chunks: Vec::new(),
                 });
-            } else if &tag[..3] == b"KB2" && (b'a'..=b'z').contains(&tag[3]) {
+            } else if &tag[..3] == b"KB2" && tag[3].is_ascii_lowercase() {
                 let fsize = u32::from_le_bytes([buf[pos + 4], buf[pos + 5], buf[pos + 6], buf[pos + 7]]) as u64;
                 let frames = u32::from_le_bytes([buf[pos + 8], buf[pos + 9], buf[pos + 10], buf[pos + 11]]);
                 let frames2 = u32::from_le_bytes([buf[pos + 16], buf[pos + 17], buf[pos + 18], buf[pos + 19]]);
@@ -4423,7 +5063,9 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
                     if next_page > off + read_n as u64 {
                         off = next_page;
                         jumped = true;
-                        need_seek = true;
+                        if let Some((req, _)) = &reader {
+                            let _ = req.send(off);
+                        }
                         break;
                     } else {
                         pos = (next_page - off) as usize;
@@ -4456,11 +5098,11 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
         let mut out = vec![0u8; 131072];
 
         while i + 8 < data.len() {
+            if claimed.contains(&(i as u64)) {
+                i += 16;
+                continue;
+            }
             if is_zlib_head(&data[i..]) {
-                if claimed.contains(&(i as u64)) {
-                    i += 16;
-                    continue;
-                }
                 decomp.reset(true);
                 let end = (i + 1024 * 1024).min(data.len());
                 if let Ok(Status::StreamEnd) = decomp.decompress(&data[i..end], &mut out, FlushDecompress::Finish) {
@@ -4541,6 +5183,61 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
     Ok((hdr_info, found))
 }
 
+// lowercase search text per entry, index matches entries
+fn build_hay(entries: &[RpfEntry]) -> Vec<String> {
+    par_map(entries, |e| {
+        let shown = display_entry_name(e, false);
+        let mut h = String::with_capacity(e.name.len() + shown.len() + e.rpf_name.len() + e.kind.len() + 3);
+        for (i, part) in [e.name.as_str(), &shown, &e.rpf_name, e.kind].into_iter().enumerate() {
+            if i > 0 {
+                h.push('|');
+            }
+            h.push_str(part);
+        }
+        if h.is_ascii() {
+            h.make_ascii_lowercase();
+            h
+        } else {
+            h.to_lowercase()
+        }
+    })
+}
+
+// indices in 0..n that pass keep, in order, checked on all cores
+fn par_filter(n: usize, keep: impl Fn(usize) -> bool + Sync) -> Vec<usize> {
+    let cores = std::thread::available_parallelism().map_or(1, |c| c.get());
+    let per = n.div_ceil(cores).max(16384);
+    if per >= n {
+        return (0..n).filter(|&i| keep(i)).collect();
+    }
+    let keep = &keep;
+    std::thread::scope(|s| {
+        let parts: Vec<_> = (0..n)
+            .step_by(per)
+            .map(|a| s.spawn(move || (a..(a + per).min(n)).filter(|&i| keep(i)).collect::<Vec<_>>()))
+            .collect();
+        parts.into_iter().flat_map(|p| p.join().expect("par_filter worker panicked")).collect()
+    })
+}
+
+// order keeping map over all cores for the big per entry passes
+fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let per = items.len().div_ceil(cores).max(4096);
+    if per >= items.len() {
+        return items.iter().map(f).collect();
+    }
+    let f = &f;
+    std::thread::scope(|s| {
+        let parts: Vec<_> = items.chunks(per).map(|c| s.spawn(move || c.iter().map(f).collect::<Vec<R>>())).collect();
+        let mut out = Vec::with_capacity(items.len());
+        for p in parts {
+            out.extend(p.join().expect("par_map worker panicked"));
+        }
+        out
+    })
+}
+
 fn display_entry_name(e: &RpfEntry, audio_named: bool) -> std::borrow::Cow<'_, str> {
     if !audio_named && e.kind == "AWC" && e.name.starts_with("sound_") && e.name.matches('_').count() > 2 {
         if let Some(tail) = e.name.rsplit('_').next() {
@@ -4610,6 +5307,10 @@ fn enrich_audio_rpf_entries(audio_rpf: &PathBuf, total_sz: u64, entries: &mut Ve
 
 impl eframe::App for Rpf9App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // a file or folder dropped onto the window opens like open file
+        if let Some(path) = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone())) {
+            self.open_any_path(path);
+        }
         self.poll_sgd5_cache();
         if let Some(pick) = self.lod_pick.take() {
             self.apply_lod_pick(pick);
@@ -4653,7 +5354,7 @@ impl eframe::App for Rpf9App {
                 }
                 self.show_3d = true;
             }
-            let loaded_parts: Vec<_> = m.loaded_vehicle_parts.drain(..).collect();
+            let loaded_parts: Vec<_> = std::mem::take(&mut m.loaded_vehicle_parts);
             let had_loaded_parts = !loaded_parts.is_empty();
             for (owner, entry, mesh) in loaded_parts {
                 if Some(owner) != self.model_entry {
@@ -4694,6 +5395,14 @@ impl eframe::App for Rpf9App {
             self.category = Category::Audio;
             self.filter = q;
         }
+        if self.content_mode {
+            if self.content_edit_at.is_some_and(|t| t.elapsed() > Duration::from_millis(450)) {
+                self.start_content_search();
+            }
+            if self.content_edit_at.is_some() || self.content.hits().running {
+                ctx.request_repaint_after(Duration::from_millis(150));
+            }
+        }
 
         egui::TopBottomPanel::top("top").frame(egui::Frame::new().fill(Color32::from_rgb(24, 14, 36)).inner_margin(10.0)).show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -4704,6 +5413,14 @@ impl eframe::App for Rpf9App {
                 ui.label(RichText::new("PERCYSTAR").size(17.0).strong().color(Color32::from_rgb(255, 168, 28)));
                 ui.label(RichText::new("RPF9").size(13.0).strong().color(Color32::from_rgb(255, 72, 165)));
                 ui.label(RichText::new(format!("v{APP_VERSION}")).size(11.5).color(Color32::from_rgb(165, 145, 195)));
+                if ui
+                    .add(egui::Button::new(RichText::new("♥ Sponsor").size(11.0).color(Color32::from_rgb(155, 135, 185))).frame(false))
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text("Optional: support ongoing R&D on GitHub Sponsors")
+                    .clicked()
+                {
+                    ctx.open_url(egui::OpenUrl::new_tab("https://github.com/sponsors/rpatty-dev"));
+                }
                 ui.add_space(10.0);
                 // Top-level mode tabs: Explorer | Model Viewer | World Map | Shaders (RDNA2)
                 for (tab_id, label) in [
@@ -4764,15 +5481,10 @@ impl eframe::App for Rpf9App {
                         .add_filter("OBJ models / PS09 shaders", &["obj", "ps09"])
                         .pick_file()
                     {
-                        let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
-                        if ext.eq_ignore_ascii_case("obj") {
+                        if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("obj")) {
                             self.open_obj_path(&p);
-                        } else if ext.eq_ignore_ascii_case("ps09") {
-                            self.reset_selection();
-                            self.tab = AppTab::Shaders;
-                            self.load_ps09_path(&p);
                         } else {
-                            self.start_single_scan(p);
+                            self.open_any_path(p);
                         }
                     }
                 }
@@ -4792,34 +5504,74 @@ impl eframe::App for Rpf9App {
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Export All").clicked() {
+                    let exporting = self.export_busy.load(Ordering::Relaxed);
+                    if exporting {
+                        if ui.button("Cancel Export").clicked() {
+                            self.export_cancel.store(true, Ordering::SeqCst);
+                        }
+                        ctx.request_repaint_after(Duration::from_millis(200));
+                    } else if ui.button("Export All").clicked() {
                         let n = self.state.lock().unwrap().entries.len();
                         let all: Vec<usize> = (0..n).collect();
                         self.export_entries(&all);
                     }
-                    if ui.button("Export Selected").clicked() {
-                        if let Some(i) = self.selected {
-                            self.export_entries(&[i]);
+                    if !exporting && ui.button("Export Selected").clicked() {
+                        let targets = self.ordered_selected_indices();
+                        if !targets.is_empty() {
+                            self.export_entries(&targets);
                         }
                     }
-                    if ui.button("Copy Path").on_hover_text("Copy selected file path (or right-click any row for more copy options)").clicked() {
-                        if let Some(i) = self.selected {
+                    let copy_shortcut = !ctx.wants_keyboard_input() && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::C));
+                    if ui.button("Copy Path").on_hover_text("Copy selected file path(s) — Ctrl+C or Ctrl+Click/Shift+Click for multi-select").clicked() || copy_shortcut {
+                        let targets = self.ordered_selected_indices();
+                        if !targets.is_empty() {
                             let copied = {
                                 let st = self.state.lock().unwrap();
-                                st.entries.get(i).map(|e| format!("{} / {}", e.rpf_name, e.name))
+                                let refs: Vec<&RpfEntry> = targets.iter().filter_map(|&i| st.entries.get(i)).collect();
+                                if refs.is_empty() { None } else { Some((refs.len(), format_multi_copy(&refs, 1))) }
                             };
-                            if let Some(s) = copied {
+                            if let Some((n, s)) = copied {
                                 ui.ctx().copy_text(s.clone());
-                                self.state.lock().unwrap().status = format!("Copied: {s}");
+                                self.state.lock().unwrap().status = if n > 1 {
+                                    format!("Copied {n} paths")
+                                } else {
+                                    format!("Copied: {s}")
+                                };
                             }
                         }
                     }
-                    let r = ui.add(egui::TextEdit::singleline(&mut self.filter).desired_width(250.0).hint_text("Search (Ctrl+F) · words AND · -exclude"));
+                    let hint = if self.content_mode { "Search inside files · words AND · -exclude" } else { "Search (Ctrl+F) · words AND · -exclude" };
+                    let r = ui.add(egui::TextEdit::singleline(&mut self.filter).desired_width(250.0).hint_text(hint));
                     if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
                         r.request_focus();
                     }
                     if r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                         self.filter.clear();
+                        if self.content_mode {
+                            self.content_edit_at = Some(Instant::now());
+                        }
+                    }
+                    if self.content_mode {
+                        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            self.start_content_search();
+                        } else if r.changed() {
+                            self.content_edit_at = Some(Instant::now());
+                        }
+                    }
+                    let in_files = egui::Button::new(
+                        RichText::new("In files").strong().color(if self.content_mode { Color32::BLACK } else { Color32::from_rgb(255, 225, 95) }),
+                    )
+                    .fill(if self.content_mode { Color32::from_rgb(255, 225, 95) } else { Color32::from_rgb(38, 24, 56) });
+                    let tip = format!("Search the text inside {} files instead of file names", content_search::KINDS.join(", "));
+                    if ui.add(in_files).on_hover_text(tip).clicked() {
+                        self.content_mode = !self.content_mode;
+                        if self.content_mode {
+                            self.start_content_search();
+                        } else {
+                            self.content_edit_at = None;
+                            self.content.cancel();
+                            self.view_key = None;
+                        }
                     }
                 });
             });
@@ -4976,26 +5728,68 @@ impl eframe::App for Rpf9App {
                     }
                 }
             }
+            if !ctx.wants_keyboard_input() && !self.view.is_empty() && ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::A)) {
+                self.multi_selected = self.view.iter().copied().collect();
+                self.state.lock().unwrap().status = format!("{} entries selected (Ctrl+C to copy)", self.multi_selected.len());
+            }
             ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("{} results", self.view.len())).size(11.0).color(Color32::from_rgb(110, 118, 134)));
+                let n_sel = self.multi_selected.len();
+                let mut res_lbl = if n_sel > 1 {
+                    format!("{} results ({n_sel} selected)", self.view.len())
+                } else {
+                    format!("{} results", self.view.len())
+                };
+                if self.content_mode && !self.filter.trim().is_empty() {
+                    let h = self.content.hits();
+                    if h.running {
+                        res_lbl += &format!(" · searching inside files {}/{}", h.scanned, h.total);
+                    } else {
+                        res_lbl += &format!(" · inside {} files", h.total);
+                    }
+                }
+                ui.label(RichText::new(res_lbl).size(11.0).color(Color32::from_rgb(110, 118, 134)));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     sort_combo(ui, "explorer_sort_combo", &mut self.sort_mode);
                 });
             });
-            let mut clicked = None;
+            let mut clicked: Option<(usize, bool, bool)> = None;
             let mut copied_msg: Option<String> = None;
+            let mut row_rects: Vec<(usize, f32, f32)> = Vec::new();
             let scroll_to_sel = std::mem::take(&mut self.explorer_scroll_to_sel);
             // rows must be exactly row_h tall or show_rows miscomputes total height
             const ROW_H: f32 = 20.0;
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, ROW_H, self.view.len(), |ui, range| {
+            let (p_down, p_pos, ctrl_held, esc_pressed) = ctx.input(|i| {
+                (
+                    i.pointer.primary_down(),
+                    i.pointer.interact_pos(),
+                    i.modifiers.command,
+                    i.key_pressed(egui::Key::Escape),
+                )
+            });
+            if esc_pressed || !p_down {
+                self.marquee_start = None;
+            }
+            let marquee_active = p_down
+                && self.marquee_start.is_some()
+                && p_pos.is_some_and(|p| self.marquee_start.unwrap().distance(p) > 5.0);
+            let scroll_resp = egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .enable_scrolling(!marquee_active)
+                .show_rows(ui, ROW_H, self.view.len(), |ui, range| {
                 let rows: Vec<(usize, RpfEntry)> = {
                     let st = self.state.lock().unwrap();
                     self.view[range].iter().filter_map(|&i| st.entries.get(i).map(|e| (i, e.clone()))).collect()
                 };
-                for (idx, e) in &rows {
+                let snippets: Vec<Option<String>> = if self.content_mode {
+                    let h = self.content.hits();
+                    rows.iter().map(|(i, _)| h.found.get(i).cloned()).collect()
+                } else {
+                    vec![None; rows.len()]
+                };
+                for ((idx, e), snippet) in rows.iter().zip(snippets) {
                     let w = ui.available_width();
-                    ui.allocate_ui_with_layout(egui::vec2(w, ROW_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    let row_alloc = ui.allocate_ui_with_layout(egui::vec2(w, ROW_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         ui.set_height(ROW_H);
                         ui.label(RichText::new(format!("{:<4}", e.kind)).strong().size(11.5).color(kind_color(e.kind)));
                         let sz_s = format_size(e.raw_size);
@@ -5005,25 +5799,93 @@ impl eframe::App for Rpf9App {
                         } else {
                             format!("{}  ({})", dname, sz_s)
                         };
-                        let is_sel = self.selected == Some(*idx);
-                        let resp = ui.selectable_label(is_sel, RichText::new(label).size(12.5));
-                        if is_sel && scroll_to_sel {
+                        let is_sel = self.selected == Some(*idx) || self.multi_selected.contains(idx);
+                        let mut resp = ui.selectable_label(is_sel, RichText::new(label).size(12.5));
+                        if let Some(snippet) = snippet.filter(|s| !s.is_empty()) {
+                            ui.label(RichText::new(&snippet).size(11.0).color(Color32::from_rgb(150, 156, 170)));
+                            resp = resp.on_hover_text(snippet);
+                        }
+                        if is_sel && scroll_to_sel && self.selected == Some(*idx) {
                             resp.scroll_to_me(Some(egui::Align::Center));
                         }
                         if resp.clicked() {
-                            clicked = Some(*idx);
+                            let (ctrl, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
+                            clicked = Some((*idx, ctrl, shift));
                         }
-                        if let Some(msg) = entry_context_menu(&resp, e) {
+                        if self.multi_selected.len() > 1 && self.multi_selected.contains(idx) {
+                            let targets = self.ordered_selected_indices();
+                            resp.context_menu(|ui| {
+                                let n = targets.len();
+                                if ui.button(format!("Copy {n} File Names")).clicked() {
+                                    let st = self.state.lock().unwrap();
+                                    let refs: Vec<&RpfEntry> = targets.iter().filter_map(|&i| st.entries.get(i)).collect();
+                                    ui.ctx().copy_text(format_multi_copy(&refs, 0));
+                                    copied_msg = Some(format!("Copied {n} file names"));
+                                    ui.close_menu();
+                                }
+                                if ui.button(format!("Copy {n} Archive / File Paths")).clicked() {
+                                    let st = self.state.lock().unwrap();
+                                    let refs: Vec<&RpfEntry> = targets.iter().filter_map(|&i| st.entries.get(i)).collect();
+                                    ui.ctx().copy_text(format_multi_copy(&refs, 1));
+                                    copied_msg = Some(format!("Copied {n} paths"));
+                                    ui.close_menu();
+                                }
+                                if ui.button(format!("Copy {n} Offset Locations")).clicked() {
+                                    let st = self.state.lock().unwrap();
+                                    let refs: Vec<&RpfEntry> = targets.iter().filter_map(|&i| st.entries.get(i)).collect();
+                                    ui.ctx().copy_text(format_multi_copy(&refs, 2));
+                                    copied_msg = Some(format!("Copied {n} locations"));
+                                    ui.close_menu();
+                                }
+                            });
+                        } else if let Some(msg) = entry_context_menu(&resp, e) {
                             copied_msg = Some(msg);
                         }
                     });
+                    row_rects.push((*idx, row_alloc.response.rect.min.y, row_alloc.response.rect.max.y));
                 }
             });
+            // Marquee drag selection in Explorer list (#38, #41 scroll-locked while active)
+            let list_rect = scroll_resp.inner_rect;
+            if p_down && !esc_pressed {
+                if let Some(pos) = p_pos {
+                    if self.marquee_start.is_none() && list_rect.contains(pos) {
+                        self.marquee_start = Some(pos);
+                    }
+                    if let Some(start) = self.marquee_start {
+                        if start.distance(pos) > 5.0 {
+                            let drag_rect = egui::Rect::from_two_pos(start, pos).intersect(list_rect);
+                            ui.painter().rect(
+                                drag_rect,
+                                2.0,
+                                Color32::from_rgba_unmultiplied(120, 210, 255, 40),
+                                egui::Stroke::new(1.0_f32, Color32::from_rgb(120, 210, 255)),
+                                egui::StrokeKind::Inside,
+                            );
+                            if !ctrl_held {
+                                self.multi_selected.clear();
+                            }
+                            for &(idx, y0, y1) in &row_rects {
+                                if y1 >= drag_rect.min.y && y0 <= drag_rect.max.y {
+                                    self.multi_selected.insert(idx);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                self.marquee_start = None;
+            }
             if let Some(msg) = copied_msg {
                 self.state.lock().unwrap().status = msg;
             }
-            if let Some(i) = clicked {
-                self.select_entry(i);
+            if let Some((i, ctrl, shift)) = clicked {
+                apply_multi_select(&self.view, &mut self.multi_selected, &mut self.multi_anchor, i, ctrl, shift);
+                if !ctrl && !shift {
+                    self.select_entry(i);
+                } else {
+                    self.selected = Some(i);
+                }
             }
         });
 
@@ -5105,6 +5967,7 @@ impl eframe::App for Rpf9App {
             } else if self.mesh3d.is_some() {
                 self.vehicle_variations_ui(ui);
                 self.vehicle_parts_ui(ui);
+                self.vehicle_data_ui(ui);
                 let mesh = self.mesh3d.as_mut().unwrap();
                 let mut toggle_3d = self.show_3d;
                 ui.horizontal(|ui| {
@@ -5120,7 +5983,7 @@ impl eframe::App for Rpf9App {
                             self.anim_time = t;
                             let next = anim::build_stickman_mesh(&self.anim_name, t, self.anim_dur, self.anim_tracks, self.anim_seed);
                             mesh.verts = next.verts;
-                            mesh.dirty = true;
+                            mesh.invalidate_normals();
                         }
                     }
                     if let Some(pick) = lod_switch_ui(ui, mesh, &self.lod_siblings, self.selected) {
@@ -5135,7 +5998,7 @@ impl eframe::App for Rpf9App {
                     self.anim_time = (self.anim_time + dt) % self.anim_dur.max(0.1);
                     let next = anim::build_stickman_mesh(&self.anim_name, self.anim_time, self.anim_dur, self.anim_tracks, self.anim_seed);
                     mesh.verts = next.verts;
-                    mesh.dirty = true;
+                    mesh.invalidate_normals();
                     ctx.request_repaint();
                 }
                 self.show_3d = toggle_3d;
@@ -5148,9 +6011,17 @@ impl eframe::App for Rpf9App {
                     });
                 }
             } else {
-                egui::ScrollArea::both().show(ui, |ui| {
-                    ui.add(egui::TextEdit::multiline(&mut self.preview).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY));
-                });
+                if self.psin_selected {
+                    self.psin_tools_ui(ui);
+                }
+                match self.psin_tree.as_mut().filter(|_| self.psin_selected && !self.psin_as_text) {
+                    Some(tree) => tree.ui(ui),
+                    None => {
+                        egui::ScrollArea::both().show(ui, |ui| {
+                            ui.add(egui::TextEdit::multiline(&mut self.preview).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY));
+                        });
+                    }
+                }
             }
         });
         } // end Explorer tab
@@ -5159,498 +6030,6 @@ impl eframe::App for Rpf9App {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn model_sidebar_width_stays_stable_across_frames() {
-        let ctx = egui::Context::default();
-        let mut filter = String::new();
-        let mut widths = Vec::new();
-        for frame in 0..64 {
-            if frame == 16 { filter = "long_model_search_".repeat(100); }
-            let _ = ctx.run(egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1320.0, 800.0))),
-                ..Default::default()
-            }, |ctx| {
-                let panel = model_viewer_sidebar(ctx).show(ctx, |ui| {
-                    model_search_row(ui, &mut filter);
-                });
-                widths.push(panel.response.rect.width());
-                egui::CentralPanel::default().show(ctx, |_| {});
-            });
-        }
-        assert!(widths.iter().all(|w| (w - widths[0]).abs() <= 1.0),
-            "Sidebar expands without input: first={} last={}", widths[0], widths.last().unwrap());
-    }
-
-    #[test]
-    fn model_sidebar_recovers_from_an_oversized_saved_width() {
-        let ctx = egui::Context::default();
-        ctx.data_mut(|data| data.insert_persisted(
-            egui::Id::new("mv_sidebar"),
-            egui::containers::panel::PanelState {
-                rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(2000.0, 800.0)),
-            },
-        ));
-        let mut filter = "long_search_".repeat(100);
-        let mut hide_lods = true;
-        let mut sort = SortMode::Relevance;
-        for width in [1320.0_f32, 640.0, 960.0] {
-            for _ in 0..8 {
-                let _ = ctx.run(egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 800.0))),
-                    ..Default::default()
-                }, |ctx| {
-                    let panel = model_viewer_sidebar(ctx).show(ctx, |ui| {
-                        model_search_row(ui, &mut filter);
-                        let _ = model_browser_options(ui, &mut hide_lods, &mut sort, true);
-                    });
-                    assert!(panel.response.rect.width() <= (width * 0.45).min(480.0) + 1.0,
-                        "Sidebar {} exceeds limit for window {width}", panel.response.rect.width());
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        assert!(ui.available_width() > width * 0.5);
-                    });
-                });
-            }
-        }
-    }
-
-    #[test]
-    fn lod_sibling_names_cover_hi_mid_and_base() {
-        let want = ["cheetah2_hi.#ft".to_string(), "cheetah2_mid.#ft".to_string(), "cheetah2.#ft".to_string()];
-        for n in ["cheetah2.#ft", "cheetah2_hi.#ft", "cheetah2_MID.#ft"] {
-            assert_eq!(lod_sibling_names(n).unwrap(), want, "{n}");
-        }
-        assert_eq!(lod_sibling_names("a_b_bonnet_01_mid.#ft").unwrap()[2], "a_b_bonnet_01.#ft");
-        assert!(lod_sibling_names("noext").is_none());
-        assert!(lod_sibling_names("_hi.#ft").is_none());
-    }
-
-    #[test]
-    fn model_viewer_categories_classify_correctly() {
-        assert_eq!(classify_model_cat("VEH", "banshee_hi.#ft"), ModelCat::Vehicles);
-        assert_eq!(classify_model_cat("MODEL", "sentinelclassic2_skirt_split_l_histr_01.#ft"), ModelCat::Vehicles);
-        assert_eq!(classify_model_cat("MODEL", "cmn_spoiler_01.#ft"), ModelCat::Vehicles);
-        assert_eq!(classify_model_cat("MODEL", "toros_bumper_f_01.#ft"), ModelCat::Vehicles);
-        assert_eq!(classify_model_cat("MODEL", "a_td_plane.#dr"), ModelCat::AircraftBoats);
-        assert_eq!(classify_model_cat("MODEL", "airgator_engine_01.#ft"), ModelCat::AircraftBoats);
-        assert_eq!(classify_model_cat("MODEL", "cmn_boat_propeller_01.#ft"), ModelCat::AircraftBoats);
-        assert_eq!(classify_model_cat("MODEL", "polmav_rotor_01.#ft"), ModelCat::AircraftBoats);
-        assert_eq!(classify_model_cat("MODEL", "w_ar_carbinerifle.#dr"), ModelCat::Weapons);
-        assert_eq!(classify_model_cat("MODEL", "w_preset_rifle_assault_01.#dr"), ModelCat::Weapons);
-        assert_eq!(classify_model_cat("MODEL", "crr_alligator_american_m_00.#dr"), ModelCat::Animals);
-        assert_eq!(classify_model_cat("MODEL", "crm_dog_malinoisbelgian_m_00_body_10_coa_helis.#dr"), ModelCat::Animals);
-        assert_eq!(classify_model_cat("MODEL", "cs_donnie_head_mr1_cau_001_m_full.#dr"), ModelCat::Characters);
-        assert_eq!(classify_model_cat("MODEL", "beardbandholz_mr1_000_straight_l05_n_full"), ModelCat::Characters);
-        assert_eq!(classify_model_cat("MODEL", "hc_kingfishers_head_mr1_000.#dr"), ModelCat::Characters);
-        assert_eq!(classify_model_cat("MODEL", "bodicecorset_fb1_002.#dr"), ModelCat::Clothing);
-        assert_eq!(classify_model_cat("MODEL", "skirtpencil_fb1_019_slim_hw_high_full.#dr"), ModelCat::Clothing);
-        assert_eq!(classify_model_cat("MODEL", "gmt_skirt_mini_f_hang_01a.#dr"), ModelCat::Clothing);
-        assert_eq!(classify_model_cat("MODEL", "shoesboat_fr1_000_low_fh_full.#dr"), ModelCat::Clothing);
-        assert_eq!(classify_model_cat("MODEL", "prop_am_table_dining_13b.#dr"), ModelCat::Props);
-        assert_eq!(classify_model_cat("MODEL", "prop_am_boatlift_02.#dr"), ModelCat::Props);
-        assert_eq!(classify_model_cat("MODEL", "a_bfyb01_sea_tr_02_bridge_01.#dr"), ModelCat::World);
-        assert_eq!(classify_model_cat("MODEL", "int_grg_14_painted_wall_skirting.#dr"), ModelCat::World);
-        assert_eq!(classify_model_cat("NAVM", "nav_160_179.ynv"), ModelCat::NavMesh);
-    }
-
-    #[test]
-    fn semver_comparison_works() {
-        assert_eq!(parse_semver("1.0.3"), Some((1, 0, 3)));
-        assert_eq!(parse_semver("v1.0.4"), Some((1, 0, 4)));
-        assert!(parse_semver("v1.0.4") > parse_semver("1.0.3"));
-        assert!(parse_semver("1.1.0") > parse_semver("1.0.99"));
-        assert!(parse_semver("v1.0.3") == parse_semver("1.0.3"));
-        assert!(parse_semver("bad").is_none());
-    }
-
-    /// PERCYSTAR_PACKS_RPF=<packs.rpf> cargo test packs_vehicle_table_is_schema_not_animation -- --nocapture
-    #[test]
-    fn packs_vehicle_table_is_schema_not_animation() {
-        let Ok(path) = std::env::var("PERCYSTAR_PACKS_RPF") else { return };
-        let path = PathBuf::from(path);
-        if !path.exists() {
-            return;
-        }
-        let mut file = File::open(path).expect("open packs.rpf");
-        let (bytes, _, _) = read_virtual_from_file(&mut file, 0x0bae_c010).expect("read vehicle table");
-        assert!(meta7a::has_schema_enums(&bytes), "vehicle tables must not be classified as clip dictionaries");
-        let configurations = vehicle_variations::parse_configurations(&bytes);
-        let stanier = configurations.get(&psin::joaat("stanierg2")).expect("stanierg2 configurations");
-        assert!(stanier.len() >= 20, "expected the authored stanierg2 rows, got {}", stanier.len());
-    }
-
-    /// PERCYSTAR_PACKS_RPF=<packs.rpf> cargo test authored_stanierg2_configurations -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    fn authored_stanierg2_configurations() {
-        let Ok(path) = std::env::var("PERCYSTAR_PACKS_RPF") else { return };
-        let path = PathBuf::from(path);
-        let (_, entries) = scan_single_rpf(&path, None).expect("scan packs.rpf");
-        let mut metadata: Vec<_> = entries.iter().filter(|entry| entry.kind == "META7A").collect();
-        // Known table resource in this supported build; also makes the fixture
-        // useful when an imported/partial catalog did not index metadata rows.
-        let fallback;
-        if metadata.is_empty() {
-            // Known packs.rpf vehicle-config resource for this supported build.
-            fallback = RpfEntry {
-                source_rpf: path.clone(),
-                rpf_name: "packs.rpf".into(),
-                name: "vehicle_tables.#7a".into(),
-                kind: "META7A",
-                offset: 0x0bae_c010,
-                comp_size: 0,
-                raw_size: 0,
-                tracks: 0,
-                chunks: Vec::new(),
-            };
-            metadata.push(&fallback);
-        }
-        assert!(!metadata.is_empty(), "no 0x7a metadata resources indexed");
-        let mut database = vehicle_variations::VehicleConfigurationDb::new();
-        let mut failures = 0usize;
-        for entry in &metadata {
-            let mut file = File::open(&entry.source_rpf).expect("open packs.rpf");
-            match read_virtual_from_file(&mut file, entry.offset) {
-                Ok((bytes, _, _)) => vehicle_variations::merge_configurations(
-                    &mut database,
-                    vehicle_variations::parse_configurations(&bytes),
-                ),
-                Err(_) => failures += 1,
-            }
-        }
-        assert!(failures < metadata.len(), "failed to decode every packs.rpf 0x7a resource");
-        let configurations = database
-            .get(&psin::joaat("stanierg2"))
-            .unwrap_or_else(|| panic!("stanierg2 configurations missing after {} meta resources", metadata.len()));
-        assert!(
-            configurations.len() >= 20,
-            "expected ~23 stanierg2 configurations, got {}",
-            configurations.len()
-        );
-        assert!(
-            configurations.iter().any(|configuration| {
-                !configuration.parts.is_empty()
-                    && configuration.parts.contains(&psin::joaat("cmn_siren_roofbar1_02"))
-            }),
-            "stanierg2 police configuration should reference the shared roofbar with a resolved part list"
-        );
-    }
-
-    #[test]
-    fn sgd5_shader_lifts_through_gfx103_paths() {
-        let shader = sgd5::Sgd5Shader {
-            stage: "VS",
-            index: 7,
-            name: "synthetic_vertex".into(),
-            wave_size: 32,
-            compressed_size: 8,
-            uncompressed_size: 8,
-            sga_hash: 0x0123_4567_89ab_cdef,
-            register_count: 8,
-            cbuffer_count: 1,
-            texture_count: 0,
-            binary_offset: 0,
-            reflection_records: Vec::new(),
-        };
-        let mut data = vec![0u8; 0x20];
-        data.extend_from_slice(&0xBFA0_0003u32.to_le_bytes());
-        data.extend_from_slice(&0xBF81_0000u32.to_le_bytes());
-        let fssm = dxbc::FssmShader {
-            code_offset: 0x20,
-            code_size: 8,
-            data,
-        };
-        let entry = sgd5_ps09_entry(
-            &sgd5::Sgd5File {
-                data: Vec::new(),
-                group_hash: 0,
-                descriptors: Vec::new(),
-                shared_reflection: sgd5::Sgd5SharedReflection {
-                    size: 0,
-                    referenced_count: 0,
-                    extra_count: 0,
-                    reserved: 0,
-                    records: Vec::new(),
-                },
-                shaders: vec![shader.clone()],
-                declared_effect_count: 0,
-                effect_count: 0,
-                trailer_flags: 0,
-                trailer_reserved: [0; 6],
-                effects: Vec::new(),
-                hash_names: Default::default(),
-                effect_shader_map: Default::default(),
-            },
-            &shader,
-            &fssm,
-        );
-
-        assert_eq!(entry.stage, ShaderStage::Vertex);
-        assert_eq!(entry.sga_hash, Some(shader.sga_hash));
-        assert_eq!(entry.insn_count, 2);
-        assert!(lift_to_hlsl(&entry, fssm.code()).contains("VSMain"));
-        assert_eq!(
-            &lift_to_spirv(&entry, fssm.code())[..4],
-            &0x0723_0203u32.to_le_bytes()
-        );
-    }
-
-    #[test]
-    fn deswizzle_and_ui_decoders_work() {
-        // 4KB SW_4KB_D bijective permutation test on 64x64 BC7 (16x16 blocks, 1 tile)
-        let mut raw = vec![0u8; 4096];
-        for blk in 0..256 {
-            raw[blk * 16] = blk as u8;
-        }
-        let lin = tex::deswizzle_4kb_d(&raw, 64, 64, true, 16);
-        assert_eq!(lin.len(), 4096);
-        let mut seen = [false; 256];
-        for blk in 0..256 {
-            seen[lin[blk * 16] as usize] = true;
-        }
-        assert!(seen.iter().all(|&b| b), "SW_4KB_D 128bpp must be a full bijection");
-
-        // 64KB TTPF bijective permutation test on 256x256 BC7 (64x64 blocks, 1 tile)
-        let mut raw64 = vec![0u8; 65536];
-        for blk in 0..4096 {
-            raw64[blk * 16] = (blk & 0xFF) as u8;
-            raw64[blk * 16 + 1] = ((blk >> 8) & 0xFF) as u8;
-        }
-        let lin64 = tex::deswizzle_64kb_ttpf(&raw64, 256, 256, true, 16);
-        assert_eq!(lin64.len(), 65536);
-        let mut seen64 = vec![false; 4096];
-        for blk in 0..4096 {
-            let v = (lin64[blk * 16] as usize) | ((lin64[blk * 16 + 1] as usize) << 8);
-            seen64[v] = true;
-        }
-        assert!(seen64.iter().all(|&b| b), "TTPF 64KB 128bpp must be a full bijection");
-
-        // RBF0 GTA6 header (0xFB 0xFF 0x01 0x00) decode test
-        let mut rbf = Vec::new();
-        rbf.extend_from_slice(b"RBF0");
-        rbf.extend_from_slice(&[0xFB, 0xFF, 0x01, 0x00]); // GTA6 header
-        rbf.extend_from_slice(&[0x00, 0x00, 0x04, 0x00]); // idx=0, struct, name len=4
-        rbf.extend_from_slice(b"Root");
-        rbf.extend_from_slice(&[0u8; 6]); // struct header
-        rbf.extend_from_slice(&[0x01, 0x10, 0x02, 0x00]); // idx=1, u32 attr, len=2
-        rbf.extend_from_slice(b"id");
-        rbf.extend_from_slice(&42u32.to_le_bytes());
-        rbf.extend_from_slice(&[0xFF, 0xFF]); // close Root
-        let xml = decode_rbf0(&rbf).expect("RBF0 should decode");
-        assert!(xml.contains("<Root id=\"42\" />"), "got: {xml}");
-
-        // scaleform gfx inspector test
-        let mut gfx = Vec::new();
-        gfx.extend_from_slice(b"GFX\x2a");
-        gfx.extend_from_slice(&128u32.to_le_bytes());
-        gfx.extend_from_slice(b"\0com.rockstargames.gtav.HudMap\0");
-        let dump = inspect_gfx(&gfx);
-        assert!(dump.contains("Version: 42"));
-        assert!(dump.contains("com.rockstargames.gtav.HudMap"));
-
-        // unicode 13 language gxt text table probe and decode test
-        let mut gxt = vec![0u8; 0x60];
-        gxt[0x10..0x15].copy_from_slice(b"0DRPz");
-        gxt.extend_from_slice("彩色字幕\0Привет мир\0한국어 자막\0日本語テキスト\0".as_bytes());
-        assert!(tex::probe_gxt_snippet(&gxt).is_some());
-        let txt = decode_0drpz_text(&gxt).expect("unicode gxt should decode");
-        assert!(txt.contains("彩色字幕") && txt.contains("Привет мир") && txt.contains("한국어 자막") && txt.contains("日本語テキスト"));
-    }
-
-    /// Writes sample PNGs from a big .ttpf so decode quality can be eyeballed:
-    /// PERCY_TTPF=<file> PERCY_OUT=<dir> cargo test --release dump_ttpf_samples -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    fn dump_ttpf_samples() {
-        let (Ok(src), Ok(out)) = (std::env::var("PERCY_TTPF"), std::env::var("PERCY_OUT")) else { return };
-        let src = PathBuf::from(src);
-        let t = Instant::now();
-        let ix = tex::ttpf_index(&src).expect("index");
-        eprintln!("index: {} textures in {:.1}s", ix.descs.len(), t.elapsed().as_secs_f32());
-        let _ = fs::create_dir_all(&out);
-        let (mut ok, mut bcpack, mut fail) = (0, 0, 0);
-        let step = (ix.descs.len() / 60).max(1);
-        for d in ix.descs.iter().step_by(step) {
-            let t1 = Instant::now();
-            match decode_ttpf_texture(&src, d.idx) {
-                Ok(tx) => {
-                    ok += 1;
-                    let _ = export_texture_png(&tx, &Path::new(&out).join(format!("{}.png", tx.name)));
-                    if ok <= 5 { eprintln!("  {} in {} ms", tx.name, t1.elapsed().as_millis()); }
-                }
-                Err(e) if e.contains("BCPack") => bcpack += 1,
-                Err(e) => { fail += 1; eprintln!("  #{} fail: {e}", d.idx); }
-            }
-        }
-        eprintln!("ok={ok} bcpack={bcpack} fail={fail}");
-        // raw virtual dumps (whole allocation) for offline layout analysis
-        if let Ok(ids) = std::env::var("PERCY_RAW") {
-            for id in ids.split(',').filter_map(|x| x.parse::<usize>().ok()) {
-                let d = &ix.descs[id];
-                if let Ok(raw) = tex::ttpf_read_virtual(&src, &ix, d.byte_off, d.alloc_sz as usize) {
-                    let nm = format!("raw_{}_{}x{}_f{:02x}_m{}_a{}.bin", id, d.w, d.h, d.fmt_byte, d.has_mips as u8, d.alloc_sz);
-                    let _ = fs::write(Path::new(&out).join(nm), raw);
-                }
-            }
-        }
-    }
-
-    /// PERCY_RPF=<textures.rpf> PERCY_OUT=<dir>: dump every TXD texture as PNG
-    #[test]
-    #[ignore]
-    fn dump_txd_samples() {
-        let (Ok(src), Ok(out)) = (std::env::var("PERCY_RPF"), std::env::var("PERCY_OUT")) else { return };
-        let src = PathBuf::from(src);
-        let _ = fs::create_dir_all(&out);
-        let t = Instant::now();
-        let (_, entries) = scan_single_rpf(&src, None, false).unwrap();
-        let txds: Vec<_> = entries.iter().filter(|e| e.kind == "TXD").collect();
-        eprintln!("{} TXD in {:.1}s", txds.len(), t.elapsed().as_secs_f32());
-        let (mut ok, mut fail) = (0, 0);
-        for e in txds.iter().take(40) {
-            let t1 = Instant::now();
-            match decode_txd_from_rpf(&src, e.offset) {
-                Ok(v) => for (k, tx) in v.iter().enumerate().take(3) {
-                    ok += 1;
-                    let _ = export_texture_png(tx, &Path::new(&out).join(format!("{}_{k}_{}.png", e.offset, tx.name.replace(|c: char| !c.is_ascii_alphanumeric() && c != '_', "_"))));
-                    if ok < 4 { eprintln!("  {} {}x{} {} in {} ms", tx.name, tx.w, tx.h, tx.fmt_name, t1.elapsed().as_millis()); }
-                },
-                Err(er) => { fail += 1; eprintln!("  fail {}: {er}", e.name); }
-            }
-        }
-        eprintln!("ok={ok} fail={fail}");
-    }
-
-    /// Brute-force layout finder: PERCY_TTPF, PERCY_OUT, PERCY_IDS=1,2,3
-    #[test]
-    #[ignore]
-    fn ttpf_layout_search() {
-        let (Ok(src), Ok(out), Ok(ids)) = (std::env::var("PERCY_TTPF"), std::env::var("PERCY_OUT"), std::env::var("PERCY_IDS")) else { return };
-        let src = PathBuf::from(src);
-        let ix = tex::ttpf_index(&src).unwrap();
-        let _ = fs::create_dir_all(&out);
-        for id in ids.split(',').filter_map(|x| x.parse::<usize>().ok()) {
-            let d = &ix.descs[id];
-            let Ok(raw) = tex::ttpf_read_virtual(&src, &ix, d.byte_off, d.alloc_sz as usize) else { eprintln!("{id}: bcpack"); continue };
-            let mut res = Vec::new();
-            for (dxgi, bpe, is_bc) in [(98u8, 16usize, true), (71, 8, true), (77, 16, true), (80, 8, true), (83, 16, true), (95, 16, true), (28, 4, false), (61, 1, false), (49, 2, false)] {
-                let (bw, bh) = if is_bc { ((d.w + 3) / 4, (d.h + 3) / 4) } else { (d.w, d.h) };
-                for t64 in [false, true] {
-                    if t64 && !is_bc { continue; }
-                    let pad = if t64 {
-                        let (tw, th) = if bpe == 16 { (64, 64) } else { (128, 64) };
-                        ((bw + tw - 1) / tw) * tw * ((bh + th - 1) / th) * th * bpe
-                    } else { tex::padded_4kb_size(d.w, d.h, is_bc, bpe) };
-                    let mut offs = vec![0usize];
-                    if raw.len() > pad { offs.push(raw.len() - pad); }
-                    let mut o = 0x1000; while o + pad <= raw.len() && offs.len() < 40 { offs.push(o); o += 0x1000; }
-                    offs.sort(); offs.dedup();
-                    for off in offs {
-                        if off + pad > raw.len() && off != 0 { continue; }
-                        let sl = &raw[off..raw.len().min(off + pad)];
-                        let lin = if t64 { tex::deswizzle_64kb_ttpf(sl, d.w, d.h, is_bc, bpe) } else { tex::deswizzle_4kb_d(sl, d.w, d.h, is_bc, bpe) };
-                        let Some(px) = tex::decode_linear_to_rgba(&lin, d.w, d.h, dxgi) else { continue };
-                        let mut diff = 0u64;
-                        for y in 0..d.h { for x in 1..d.w {
-                            let (a, b) = (px[y * d.w + x - 1], px[y * d.w + x]);
-                            diff += (a.r() as i32 - b.r() as i32).unsigned_abs() as u64 + (a.g() as i32 - b.g() as i32).unsigned_abs() as u64;
-                        }}
-                        for y in 1..d.h { for x in 0..d.w {
-                            let (a, b) = (px[(y - 1) * d.w + x], px[y * d.w + x]);
-                            diff += (a.r() as i32 - b.r() as i32).unsigned_abs() as u64 + (a.g() as i32 - b.g() as i32).unsigned_abs() as u64;
-                        }}
-                        res.push((diff as f64 / (d.w * d.h) as f64, dxgi, t64, off, px));
-                    }
-                }
-            }
-            res.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-            eprintln!("tex {id} {}x{} f{:02x} mips={} alloc={:#x}", d.w, d.h, d.fmt_byte, d.has_mips, d.alloc_sz);
-            for (k, (sc, dx, t64, off, px)) in res.iter().take(4).enumerate() {
-                eprintln!("   score {sc:.1} dxgi {dx} t64 {t64} off {off:#x}");
-                let t = tex::DecodedTexture { name: String::new(), w: d.w, h: d.h, mips: 1, dxgi: *dx, fmt_name: "", pixels: px.clone(), raw_dds_payload: vec![] };
-                let _ = export_texture_png(&t, &Path::new(&out).join(format!("{id}_{k}.png")));
-            }
-        }
-    }
-
-    #[test]
-    fn real_gta6_archives_smoke_test() {
-        let base = Path::new(r"D:\Grand Theft Auto VI Build");
-        if !base.exists() { return; }
-
-        // 1. TTPF native scan + decode
-        let ttpf = base.join("data").join("ttdb").join("ui").join("platform.ttpf");
-        if ttpf.exists() {
-            let (info, descs) = scan_ttpf_descriptors(&ttpf).expect("scan platform.ttpf");
-            assert!(!descs.is_empty(), "platform.ttpf descriptors empty: {info}");
-            let mut decoded_ok = 0usize;
-            for d in descs.iter().take(25) {
-                if let Ok(t) = decode_ttpf_texture(&ttpf, d.idx) {
-                    assert_eq!(t.pixels.len(), t.w * t.h);
-                    decoded_ok += 1;
-                    if decoded_ok >= 3 { break; }
-                }
-            }
-            assert!(decoded_ok >= 1, "expected at least 1 decoded texture from platform.ttpf");
-        }
-
-        // 1b. Previously unsupported TTPF formats: DXGI 28 (RGBA8), 54 (R16F), 61 (R8), 65 (A8), 87 (BGRA8), 96 (BC6H_SF16)
-        for (rel, idx, exp_dxgi) in [
-            ("data\\ttdb\\graphics\\ttdb_graphics.ttpf", 1usize, 28u8),
-            ("data\\ttdb\\graphics\\ttdb_graphics.ttpf", 563usize, 87u8),
-            ("data\\ttdb\\maps\\ttdb_maps_0_7.ttpf", 605usize, 54u8),
-            ("data\\ttdb\\interiors\\ttdb_interiors_0_3.ttpf", 1984usize, 65u8),
-            ("data\\ttdb\\vfx\\ttdb_vfx.ttpf", 608usize, 61u8),
-            ("data\\ttdb\\lighting\\lighting.ttpf", 334usize, 96u8),
-        ] {
-            let p = base.join(rel);
-            if p.exists() {
-                let t = decode_ttpf_texture(&p, idx).unwrap_or_else(|e| panic!("{rel} #{idx}: {e}"));
-                assert_eq!(t.dxgi, exp_dxgi);
-                assert_eq!(t.pixels.len(), t.w * t.h);
-            }
-        }
-
-        // 2. TXD native scan + decode from textures.rpf
-        let tex_rpf = base.join("textures.rpf");
-        if tex_rpf.exists() {
-            let (_, entries) = scan_single_rpf(&tex_rpf, None, false).expect("scan textures.rpf");
-            let txds: Vec<&RpfEntry> = entries.iter().filter(|e| e.kind == "TXD").collect();
-            assert!(!txds.is_empty(), "textures.rpf should yield TXD entries");
-            let t0 = decode_txd_from_rpf(&tex_rpf, txds[0].offset).expect("decode first TXD");
-            assert!(!t0.is_empty());
-            assert_eq!(t0[0].pixels.len(), t0[0].w * t0[0].h);
-        }
-
-        // 3. CNavMesh 3D decode from navmeshes.rpf (first CNavMesh block starts at ~750MB after path regions)
-        let nav_rpf = base.join("navmeshes.rpf");
-        if nav_rpf.exists() {
-            let mut f = File::open(&nav_rpf).unwrap();
-            let base_off = 786_010_112u64; // page holding first CNavMesh tile (786010128 - 0x10)
-            f.seek(SeekFrom::Start(base_off)).unwrap();
-            let mut buf = vec![0u8; 256 * 1024];
-            let n = f.read(&mut buf).unwrap();
-            let mut dec = Decompress::new(true);
-            let mut out = vec![0u8; 32768];
-            let e = probe_rage9_page(&buf, 0, n, base_off, &nav_rpf, "navmeshes.rpf", &mut dec, &mut out)
-                .expect("should detect NAVM in navmeshes.rpf");
-            assert_eq!(e.kind, "NAVM");
-            assert!(e.name.starts_with("nav_160_179_"), "got {}", e.name);
-            let mesh = decode_navmesh_from_rpf(&nav_rpf, e.offset, &e.name).expect("decode NAVM mesh");
-            assert!(!mesh.verts.is_empty() && !mesh.tris.is_empty());
-        }
-
-        // 4. packs.rpf catalog model decode (verifies +0xA8 name + SW_4KB_D embedded tex)
-        let packs_rpf = base.join("packs.rpf");
-        if packs_rpf.exists() {
-            let mesh = decode_rage9_model_from_rpf(&packs_rpf, 0x47ab1010, "fallback").expect("decode packs.rpf model");
-            assert!(!mesh.verts.is_empty() && !mesh.tris.is_empty());
-        }
-    }
-}
 
 fn export_models_cli(rpf_path: &PathBuf, out_dir: &PathBuf, filter: &str, vehicles_only: bool) {
     let _ = fs::create_dir_all(out_dir);
@@ -5692,9 +6071,9 @@ fn export_models_cli(rpf_path: &PathBuf, out_dir: &PathBuf, filter: &str, vehicl
     for (idx, (key, off, name)) in list.iter().enumerate() {
         if let Ok(mesh) = decode_rage9_model_from_rpf(rpf_path, *off, name) {
             let fname = if vehicles_only { format!("{key}.obj") } else { format!("{}.obj", name.replace('#', "").replace('.', "_")) };
-            if mesh.export_obj(&out_dir.join(fname)).is_ok() {
+            if mesh.export_obj(&out_dir.join(safe_file_name(&fname))).is_ok() {
                 ok += 1;
-                if ok <= 25 || ok % 50 == 0 {
+                if ok <= 25 || ok.is_multiple_of(50) {
                     eprintln!("  [{}/{}] {} ({} v, {} f)", idx + 1, list.len(), key, mesh.verts.len(), mesh.tris.len());
                 }
             }
@@ -5717,7 +6096,7 @@ fn dump_textures_cli(src_path: &PathBuf, out_dir: &PathBuf, limit: usize) {
         for d in ix.descs.iter().take(n) {
             match decode_ttpf_texture(src_path, d.idx) {
                 Ok(tx) => {
-                    if export_texture_png(&tx, &out_dir.join(format!("{}.png", tx.name))).is_ok() {
+                    if export_texture_png(&tx, &out_dir.join(format!("{}.png", safe_file_name(&tx.name)))).is_ok() {
                         ok += 1;
                     }
                 }
@@ -5897,6 +6276,85 @@ fn extract_sgd5_cli(src: &Path, out_dir: &Path, limit: usize) {
     }
 }
 
+fn decode_audio_cli(rpf_path: &Path, out_dir: &Path, limit: usize) {
+    let _ = fs::create_dir_all(out_dir);
+    let Ok(mut f) = File::open(rpf_path) else {
+        eprintln!("Failed to open {}", rpf_path.display());
+        return;
+    };
+    let sz = f.metadata().map(|m| m.len()).unwrap_or(0).min(2 * 1024 * 1024 * 1024);
+    let mut off = 0u64;
+    let mut buf = vec![0u8; 16 * 1024 * 1024];
+    let mut banks = Vec::new();
+    while off < sz {
+        let Ok(n) = f.read(&mut buf) else { break };
+        if n == 0 { break; }
+        let mut pos = 0usize;
+        while pos + 16 <= n {
+            if &buf[pos..pos + 4] == b"ADAT" {
+                let sc = u32::from_le_bytes([buf[pos + 8], buf[pos + 9], buf[pos + 10], buf[pos + 11]]);
+                let hdr_sz = u32::from_le_bytes([buf[pos + 12], buf[pos + 13], buf[pos + 14], buf[pos + 15]]);
+                if (1..=256).contains(&sc) && (16..=65536).contains(&hdr_sz) {
+                    banks.push((off + pos as u64, sc));
+                    if limit > 0 && banks.len() >= limit { break; }
+                }
+            }
+            pos += 16;
+        }
+        if limit > 0 && banks.len() >= limit { break; }
+        off += n.saturating_sub(64) as u64;
+        let _ = f.seek(SeekFrom::Start(off));
+    }
+    let mut total_wavs = 0usize;
+    let mut bank_data = vec![0u8; 256 * 1024];
+    for (i, &(bank_off, sc)) in banks.iter().enumerate() {
+        let _ = f.seek(SeekFrom::Start(bank_off));
+        let n = f.read(&mut bank_data).unwrap_or(0);
+        let stem = format!("bank_{i:03}_off_{bank_off:08x}_{sc}st");
+        let res = awc::decode_awc_bytes_to_wavs_detailed(&bank_data[..n], out_dir, &stem);
+        total_wavs += res.wavs.len();
+    }
+    println!("Exported {total_wavs} WAV tracks from {} banks -> {}", banks.len(), out_dir.display());
+}
+
+fn decode_navmesh_cli(rpf_path: &Path, out_dir: &Path, limit: usize) {
+    let _ = fs::create_dir_all(out_dir);
+    let Ok(mut f) = File::open(rpf_path) else {
+        eprintln!("Failed to open {}", rpf_path.display());
+        return;
+    };
+    let base_off = 786_010_112u64;
+    let _ = f.seek(SeekFrom::Start(base_off));
+    let mut buf = vec![0u8; 32 * 1024 * 1024];
+    let n = f.read(&mut buf).unwrap_or(0);
+    let mut dec = Decompress::new(true);
+    let mut out = vec![0u8; 32768];
+    let mut ok = 0usize;
+    let mut pos = 0usize;
+    while pos + 32 <= n {
+        if buf[pos] == 0x78 && matches!(buf[pos + 1], 0x01 | 0x5e | 0x9c | 0xda) {
+            dec.reset(true);
+            let _ = dec.decompress(&buf[pos..(pos + 32768).min(n)], &mut out, FlushDecompress::None);
+            if dec.total_out() >= 0xD0 && u32::from_le_bytes([out[0x14], out[0x15], out[0x16], out[0x17]]) == 0x0001_0015 {
+                let midx = u32::from_le_bytes([out[0xC8], out[0xC9], out[0xCA], out[0xCB]]);
+                let nm = if midx < 512 * 512 {
+                    format!("nav_{:03}_{:03}", midx % 512, midx / 512)
+                } else {
+                    format!("nav_dyn_{midx:06x}")
+                };
+                if let Ok(mesh) = tex::decode_navmesh_from_rpf(rpf_path, base_off + pos as u64, &nm) {
+                    if mesh.export_obj(&out_dir.join(format!("{nm}.obj"))).is_ok() {
+                        ok += 1;
+                        if limit > 0 && ok >= limit { break; }
+                    }
+                }
+            }
+        }
+        pos += 16;
+    }
+    println!("Exported {ok} CNavMesh .obj tiles -> {}", out_dir.display());
+}
+
 fn disassemble_dxbc_cli(src: &Path, output: Option<&PathBuf>) {
     match fs::read(src) {
         Ok(data) => {
@@ -6045,6 +6503,10 @@ fn main() -> eframe::Result<()> {
         }
         return Ok(());
     }
+    if args.len() >= 3 && args[1] == "--bench" {
+        bench::run(Path::new(&args[2]), args.get(3).and_then(|s| s.parse().ok()).unwrap_or(3), args.get(4).map_or("", String::as_str));
+        return Ok(());
+    }
     if args.len() >= 3 && args[1] == "--probe-maps" {
         mapdata::probe_maps_cli(&PathBuf::from(&args[2]));
         return Ok(());
@@ -6064,8 +6526,15 @@ fn main() -> eframe::Result<()> {
         let bk2 = PathBuf::from(&args[2]);
         let out_dir = PathBuf::from(&args[3]);
         let max_f = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(30);
-        let dll = bk2.parent().map(|d| d.join("bink2w64.dll")).filter(|p| p.exists())
-            .unwrap_or_else(|| PathBuf::from("bink2w64.dll"));
+        // never from the folder of the input clip or by bare name both let a planted dll run
+        let dll = std::env::var_os("BINK2_DLL")
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("bink2w64.dll"))))
+            .filter(|p| p.is_absolute() && p.is_file());
+        let Some(dll) = dll else {
+            eprintln!("BK2 decode error: bink2w64.dll not found next to PercyStar (or set BINK2_DLL to its full path)");
+            return Ok(());
+        };
         match bink2::decode_bk2_to_pngs(&dll, &bk2, &out_dir, max_f) {
             Ok((info, n)) => println!("Decoded {n} frames ({}x{}) to {}", info.width, info.height, out_dir.display()),
             Err(e) => eprintln!("BK2 decode error: {e}"),
@@ -6131,6 +6600,17 @@ fn main() -> eframe::Result<()> {
         export_models_cli(&PathBuf::from(&args[2]), &PathBuf::from(&args[3]), filt, false);
         return Ok(());
     }
+    if args.len() >= 4 && args[1] == "--decode-audio" {
+        let lim = args.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+        decode_audio_cli(&PathBuf::from(&args[2]), &PathBuf::from(&args[3]), lim);
+        return Ok(());
+    }
+    if args.len() >= 4 && args[1] == "--decode-navmesh" {
+        let lim = args.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+        decode_navmesh_cli(&PathBuf::from(&args[2]), &PathBuf::from(&args[3]), lim);
+        return Ok(());
+    }
+
     if args.len() >= 3 && args[1] == "--scan" {
         scan_cli(&args[2..]);
         return Ok(());
@@ -6149,5 +6629,699 @@ fn main() -> eframe::Result<()> {
     }
     let opts = eframe::NativeOptions { viewport: vb, ..Default::default() };
     let title = format!("PercyStar v{APP_VERSION}");
-    eframe::run_native(&title, opts, Box::new(move |cc| Ok(Box::new(Rpf9App::new(cc, logo_rgba)))))
+    // percystar <path> opens a folder archive model or shader cache directly
+    let startup = args.get(1).filter(|a| !a.starts_with("--")).map(PathBuf::from).filter(|p| p.exists());
+    eframe::run_native(&title, opts, Box::new(move |cc| Ok(Box::new(Rpf9App::new(cc, logo_rgba, startup)))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // name recovery over the small archives of a real dump, prints what it resolves
+    #[test]
+    fn name_recovery_on_real_archives() {
+        let Ok(levels) = std::env::var("PERCYSTAR_LEVELS_RPF") else { return };
+        let Some(root) = Path::new(&levels).parent() else { return };
+        let mut entries = Vec::new();
+        for rpf in ["common.rpf", "script.rpf", "data.rpf"] {
+            let path = root.join(rpf);
+            if !path.exists() {
+                return;
+            }
+            let (_, found) = scan_single_rpf(&path, None, false).expect("scan");
+            entries.extend(found.into_iter().filter(|e| matches!(e.kind, "PSIN" | "XML" | "RBF0" | "DAT" | "GFX" | "ZLIB")));
+        }
+        psin::seed_names();
+        // extra word lists make the run match what the app does with a filled names folder
+        if let Ok(dir) = std::env::var("PERCYSTAR_NAMES_DIR") {
+            names::load_dir(Path::new(&dir));
+        }
+        let (targets, tokens) = gather_names(&entries, |_| {});
+        let started = Instant::now();
+        let found = names::recover(&tokens, &targets);
+        let all = targets.all();
+        let got: HashSet<u32> = found.exact.iter().chain(&found.built).map(|f| f.0).collect();
+        eprintln!(
+            "recover took {:.1}s: structs {}/{}, fields {}/{}, enum values {}/{}",
+            started.elapsed().as_secs_f32(),
+            targets.structs.iter().filter(|h| got.contains(h)).count(),
+            targets.structs.len(),
+            targets.fields.keys().filter(|h| got.contains(h)).count(),
+            targets.fields.len(),
+            targets.enums.values().flatten().filter(|h| got.contains(h)).count(),
+            targets.enums.values().map(|v| v.len()).sum::<usize>()
+        );
+        if let Ok(out) = std::env::var("PERCYSTAR_NAMES_OUT") {
+            let _ = names::save_list(Path::new(&out), names::RECOVERED_FILE, &found.exact);
+            let _ = names::save_list(Path::new(&out), names::BUILT_FILE, &found.built);
+        }
+        eprintln!(
+            "{} entries, {} words, {} hashed names: {} exact, {} built (noise about {:.0}); structs {} fields {} enum values {}",
+            entries.len(),
+            tokens.len(),
+            all.len(),
+            found.exact.len(),
+            found.built.len(),
+            found.built_noise,
+            targets.structs.len(),
+            targets.fields.len(),
+            targets.enums.values().map(|v| v.len()).sum::<usize>()
+        );
+        let has = |n: &str| found.exact.iter().any(|f| f.1 == n);
+        assert!(has("fMass") && has("fBrakeForce"), "handling names not found");
+        assert!(found.exact.len() > 500 && found.built.len() > 300);
+        assert!(found.built_noise < found.built.len() as f64 * 0.1);
+    }
+
+    fn wait_idle(media: &Arc<Mutex<MediaState>>) {
+        for _ in 0..400 {
+            if !media.lock().unwrap_or_else(|p| p.into_inner()).loading {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("media job never finished");
+    }
+
+    #[test]
+    fn style_stays_dark_when_the_system_theme_is_light() {
+        let ctx = egui::Context::default();
+        setup_style(&ctx);
+        let input = egui::RawInput { system_theme: Some(egui::Theme::Light), ..Default::default() };
+        let _ = ctx.run(input, |ctx| {
+            let visuals = ctx.style().visuals.clone();
+            assert!(visuals.dark_mode);
+            assert_eq!(visuals.panel_fill, Color32::from_rgb(18, 12, 28));
+        });
+    }
+
+    #[test]
+    fn media_jobs_drop_stale_results_and_survive_panics() {
+        let media = Arc::new(Mutex::new(MediaState::default()));
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        spawn_media_job(&media, "slow".into(), true, move |_| { let _ = held.recv(); Ok(1u32) }, |m, _| m.status = "old".into());
+        spawn_media_job(&media, "fast".into(), true, |_| Ok(2u32), |m, _| m.status = "new".into());
+        wait_idle(&media);
+        release.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(media.lock().unwrap().status, "new");
+
+        spawn_media_job(&media, "boom".into(), true, |_| -> Result<u32, String> { panic!("decoder bug") }, |m, res| m.status = res.unwrap_err());
+        wait_idle(&media);
+        assert_eq!(media.lock().unwrap().status, "decoder panicked");
+    }
+
+    #[test]
+    fn model_sidebar_width_stays_stable_across_frames() {
+        let ctx = egui::Context::default();
+        let mut filter = String::new();
+        let mut widths = Vec::new();
+        for frame in 0..64 {
+            if frame == 16 { filter = "long_model_search_".repeat(100); }
+            let _ = ctx.run(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1320.0, 800.0))),
+                ..Default::default()
+            }, |ctx| {
+                let panel = model_viewer_sidebar(ctx).show(ctx, |ui| {
+                    model_search_row(ui, &mut filter);
+                });
+                widths.push(panel.response.rect.width());
+                egui::CentralPanel::default().show(ctx, |_| {});
+            });
+        }
+        assert!(widths.iter().all(|w| (w - widths[0]).abs() <= 1.0),
+            "Sidebar expands without input: first={} last={}", widths[0], widths.last().unwrap());
+    }
+
+    #[test]
+    fn model_sidebar_recovers_from_an_oversized_saved_width() {
+        let ctx = egui::Context::default();
+        ctx.data_mut(|data| data.insert_persisted(
+            egui::Id::new("mv_sidebar"),
+            egui::containers::panel::PanelState {
+                rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(2000.0, 800.0)),
+            },
+        ));
+        let mut filter = "long_search_".repeat(100);
+        let mut hide_lods = true;
+        let mut sort = SortMode::Relevance;
+        for width in [1320.0_f32, 640.0, 960.0] {
+            for _ in 0..8 {
+                let _ = ctx.run(egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 800.0))),
+                    ..Default::default()
+                }, |ctx| {
+                    let panel = model_viewer_sidebar(ctx).show(ctx, |ui| {
+                        model_search_row(ui, &mut filter);
+                        let _ = model_browser_options(ui, &mut hide_lods, &mut sort, true);
+                    });
+                    assert!(panel.response.rect.width() <= (width * 0.45).min(480.0) + 1.0,
+                        "Sidebar {} exceeds limit for window {width}", panel.response.rect.width());
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        assert!(ui.available_width() > width * 0.5);
+                    });
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn lod_sibling_names_cover_hi_mid_and_base() {
+        let want = ["cheetah2_hi.#ft".to_string(), "cheetah2_mid.#ft".to_string(), "cheetah2.#ft".to_string()];
+        for n in ["cheetah2.#ft", "cheetah2_hi.#ft", "cheetah2_MID.#ft"] {
+            assert_eq!(lod_sibling_names(n).unwrap(), want, "{n}");
+        }
+        assert_eq!(lod_sibling_names("a_b_bonnet_01_mid.#ft").unwrap()[2], "a_b_bonnet_01.#ft");
+        assert!(lod_sibling_names("noext").is_none());
+        assert!(lod_sibling_names("_hi.#ft").is_none());
+    }
+
+    #[test]
+    fn model_viewer_categories_classify_correctly() {
+        assert_eq!(classify_model_cat("VEH", "banshee_hi.#ft"), ModelCat::Vehicles);
+        assert_eq!(classify_model_cat("MODEL", "sentinelclassic2_skirt_split_l_histr_01.#ft"), ModelCat::Vehicles);
+        assert_eq!(classify_model_cat("MODEL", "cmn_spoiler_01.#ft"), ModelCat::Vehicles);
+        assert_eq!(classify_model_cat("MODEL", "toros_bumper_f_01.#ft"), ModelCat::Vehicles);
+        assert_eq!(classify_model_cat("MODEL", "a_td_plane.#dr"), ModelCat::AircraftBoats);
+        assert_eq!(classify_model_cat("MODEL", "airgator_engine_01.#ft"), ModelCat::AircraftBoats);
+        assert_eq!(classify_model_cat("MODEL", "cmn_boat_propeller_01.#ft"), ModelCat::AircraftBoats);
+        assert_eq!(classify_model_cat("MODEL", "polmav_rotor_01.#ft"), ModelCat::AircraftBoats);
+        assert_eq!(classify_model_cat("MODEL", "w_ar_carbinerifle.#dr"), ModelCat::Weapons);
+        assert_eq!(classify_model_cat("MODEL", "w_preset_rifle_assault_01.#dr"), ModelCat::Weapons);
+        assert_eq!(classify_model_cat("MODEL", "crr_alligator_american_m_00.#dr"), ModelCat::Animals);
+        assert_eq!(classify_model_cat("MODEL", "crm_dog_malinoisbelgian_m_00_body_10_coa_helis.#dr"), ModelCat::Animals);
+        assert_eq!(classify_model_cat("MODEL", "cs_donnie_head_mr1_cau_001_m_full.#dr"), ModelCat::Characters);
+        assert_eq!(classify_model_cat("MODEL", "beardbandholz_mr1_000_straight_l05_n_full"), ModelCat::Characters);
+        assert_eq!(classify_model_cat("MODEL", "hc_kingfishers_head_mr1_000.#dr"), ModelCat::Characters);
+        assert_eq!(classify_model_cat("MODEL", "bodicecorset_fb1_002.#dr"), ModelCat::Clothing);
+        assert_eq!(classify_model_cat("MODEL", "skirtpencil_fb1_019_slim_hw_high_full.#dr"), ModelCat::Clothing);
+        assert_eq!(classify_model_cat("MODEL", "gmt_skirt_mini_f_hang_01a.#dr"), ModelCat::Clothing);
+        assert_eq!(classify_model_cat("MODEL", "shoesboat_fr1_000_low_fh_full.#dr"), ModelCat::Clothing);
+        assert_eq!(classify_model_cat("MODEL", "prop_am_table_dining_13b.#dr"), ModelCat::Props);
+        assert_eq!(classify_model_cat("MODEL", "prop_am_boatlift_02.#dr"), ModelCat::Props);
+        assert_eq!(classify_model_cat("MODEL", "a_bfyb01_sea_tr_02_bridge_01.#dr"), ModelCat::World);
+        assert_eq!(classify_model_cat("MODEL", "int_grg_14_painted_wall_skirting.#dr"), ModelCat::World);
+        assert_eq!(classify_model_cat("NAVM", "nav_160_179.ynv"), ModelCat::NavMesh);
+    }
+
+    #[test]
+    fn semver_comparison_works() {
+        assert_eq!(parse_semver("1.0.3"), Some((1, 0, 3)));
+        assert_eq!(parse_semver("v1.0.4"), Some((1, 0, 4)));
+        assert!(parse_semver("v1.0.4") > parse_semver("1.0.3"));
+        assert!(parse_semver("1.1.0") > parse_semver("1.0.99"));
+        assert!(parse_semver("v1.0.3") == parse_semver("1.0.3"));
+        assert!(parse_semver("bad").is_none());
+        // tag suffixes never reach a url the release page is rebuilt from the numbers
+        let (a, b, c) = parse_semver("v9.9.9-x&calc.exe").unwrap();
+        assert_eq!(release_page_url(&format!("{a}.{b}.{c}")), format!("{REPO_RELEASES_URL}/tag/v9.9.9"));
+    }
+
+    #[test]
+    fn exported_names_cannot_leave_the_output_folder() {
+        let out = Path::new("/out");
+        for bad in ["..\\..\\evil", "../../evil", "/etc/passwd", "C:\\Windows\\x", "..", ".", "", "a\u{0}b", "con?.obj", "trail. "] {
+            let name = safe_file_name(bad);
+            let joined = out.join(&name);
+            assert_eq!(joined.parent(), Some(out), "{bad:?} -> {name:?}");
+            assert!(!name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', ':']), "{bad:?} -> {name:?}");
+        }
+        // ordinary archive names are untouched
+        for ok in ["banshee_hi.ft", "nav_256_256_(0,0).ynv", "cheetah2.#ft", "a b-c_d.png"] {
+            assert_eq!(safe_file_name(ok), ok);
+        }
+    }
+
+    #[test]
+    fn non_ascii_model_names_classify_without_panicking() {
+        let _ = classify_model_cat("MODEL", "\u{e9}t\u{e9}_car.#dr");
+        assert!(!match_known_stem("\u{e9}abcd", &["abcd"]));
+        assert!(match_known_stem("xabcd", &["abcd"]));
+    }
+
+    /// PERCYSTAR_PACKS_RPF=<packs.rpf> cargo test packs_vehicle_table_is_schema_not_animation -- --nocapture
+    #[test]
+    fn packs_vehicle_table_is_schema_not_animation() {
+        let Ok(path) = std::env::var("PERCYSTAR_PACKS_RPF") else { return };
+        let path = PathBuf::from(path);
+        if !path.exists() {
+            return;
+        }
+        let mut file = File::open(path).expect("open packs.rpf");
+        let (bytes, _, _) = read_virtual_from_file(&mut file, 0x0bae_c010).expect("read vehicle table");
+        assert!(meta7a::has_schema_enums(&bytes), "vehicle tables must not be classified as clip dictionaries");
+        let configurations = vehicle_variations::parse_configurations(&bytes);
+        let stanier = configurations.get(&psin::joaat("stanierg2")).expect("stanierg2 configurations");
+        assert!(stanier.len() >= 20, "expected the authored stanierg2 rows, got {}", stanier.len());
+    }
+
+    /// PERCYSTAR_PACKS_RPF=<packs.rpf> cargo test authored_stanierg2_configurations -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn authored_stanierg2_configurations() {
+        let Ok(path) = std::env::var("PERCYSTAR_PACKS_RPF") else { return };
+        let path = PathBuf::from(path);
+        let (_, entries) = scan_single_rpf(&path, None, false).expect("scan packs.rpf");
+        let mut metadata: Vec<_> = entries.iter().filter(|entry| entry.kind == "META7A").collect();
+        // Known table resource in this supported build; also makes the fixture
+        // useful when an imported/partial catalog did not index metadata rows.
+        let fallback;
+        if metadata.is_empty() {
+            // Known packs.rpf vehicle-config resource for this supported build.
+            fallback = RpfEntry {
+                source_rpf: path.clone(),
+                rpf_name: "packs.rpf".into(),
+                name: "vehicle_tables.#7a".into(),
+                kind: "META7A",
+                offset: 0x0bae_c010,
+                comp_size: 0,
+                raw_size: 0,
+                tracks: 0,
+                chunks: Vec::new(),
+            };
+            metadata.push(&fallback);
+        }
+        assert!(!metadata.is_empty(), "no 0x7a metadata resources indexed");
+        let mut database = vehicle_variations::VehicleConfigurationDb::new();
+        let mut failures = 0usize;
+        for entry in &metadata {
+            let mut file = File::open(&entry.source_rpf).expect("open packs.rpf");
+            match read_virtual_from_file(&mut file, entry.offset) {
+                Ok((bytes, _, _)) => vehicle_variations::merge_configurations(
+                    &mut database,
+                    vehicle_variations::parse_configurations(&bytes),
+                ),
+                Err(_) => failures += 1,
+            }
+        }
+        assert!(failures < metadata.len(), "failed to decode every packs.rpf 0x7a resource");
+        let configurations = database
+            .get(&psin::joaat("stanierg2"))
+            .unwrap_or_else(|| panic!("stanierg2 configurations missing after {} meta resources", metadata.len()));
+        assert!(
+            configurations.len() >= 20,
+            "expected ~23 stanierg2 configurations, got {}",
+            configurations.len()
+        );
+        assert!(
+            configurations.iter().any(|configuration| {
+                !configuration.parts.is_empty()
+                    && configuration.parts.contains(&psin::joaat("cmn_siren_roofbar1_02"))
+            }),
+            "stanierg2 police configuration should reference the shared roofbar with a resolved part list"
+        );
+    }
+
+    #[test]
+    fn sgd5_shader_lifts_through_gfx103_paths() {
+        let shader = sgd5::Sgd5Shader {
+            stage: "VS",
+            index: 7,
+            name: "synthetic_vertex".into(),
+            wave_size: 32,
+            compressed_size: 8,
+            uncompressed_size: 8,
+            sga_hash: 0x0123_4567_89ab_cdef,
+            register_count: 8,
+            cbuffer_count: 1,
+            texture_count: 0,
+            binary_offset: 0,
+            reflection_records: Vec::new(),
+        };
+        let mut data = vec![0u8; 0x20];
+        data.extend_from_slice(&0xBFA0_0003u32.to_le_bytes());
+        data.extend_from_slice(&0xBF81_0000u32.to_le_bytes());
+        let fssm = dxbc::FssmShader {
+            code_offset: 0x20,
+            code_size: 8,
+            data,
+        };
+        let entry = sgd5_ps09_entry(
+            &sgd5::Sgd5File {
+                data: Vec::new(),
+                group_hash: 0,
+                descriptors: Vec::new(),
+                shared_reflection: sgd5::Sgd5SharedReflection {
+                    size: 0,
+                    referenced_count: 0,
+                    extra_count: 0,
+                    reserved: 0,
+                    records: Vec::new(),
+                },
+                shaders: vec![shader.clone()],
+                declared_effect_count: 0,
+                effect_count: 0,
+                trailer_flags: 0,
+                trailer_reserved: [0; 6],
+                effects: Vec::new(),
+                hash_names: Default::default(),
+                effect_shader_map: Default::default(),
+            },
+            &shader,
+            &fssm,
+        );
+
+        assert_eq!(entry.stage, ShaderStage::Vertex);
+        assert_eq!(entry.sga_hash, Some(shader.sga_hash));
+        assert_eq!(entry.insn_count, 2);
+        assert!(lift_to_hlsl(&entry, fssm.code()).contains("VSMain"));
+        assert_eq!(
+            &lift_to_spirv(&entry, fssm.code())[..4],
+            &0x0723_0203u32.to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn deswizzle_and_ui_decoders_work() {
+        // 4KB SW_4KB_D bijective permutation test on 64x64 BC7 (16x16 blocks, 1 tile)
+        let mut raw = vec![0u8; 4096];
+        for blk in 0..256 {
+            raw[blk * 16] = blk as u8;
+        }
+        let lin = tex::deswizzle_4kb_d(&raw, 64, 64, true, 16);
+        assert_eq!(lin.len(), 4096);
+        let mut seen = [false; 256];
+        for blk in 0..256 {
+            seen[lin[blk * 16] as usize] = true;
+        }
+        assert!(seen.iter().all(|&b| b), "SW_4KB_D 128bpp must be a full bijection");
+
+        // 64KB TTPF bijective permutation test on 256x256 BC7 (64x64 blocks, 1 tile)
+        let mut raw64 = vec![0u8; 65536];
+        for blk in 0..4096 {
+            raw64[blk * 16] = (blk & 0xFF) as u8;
+            raw64[blk * 16 + 1] = ((blk >> 8) & 0xFF) as u8;
+        }
+        let lin64 = tex::deswizzle_64kb_ttpf(&raw64, 256, 256, true, 16);
+        assert_eq!(lin64.len(), 65536);
+        let mut seen64 = vec![false; 4096];
+        for blk in 0..4096 {
+            let v = (lin64[blk * 16] as usize) | ((lin64[blk * 16 + 1] as usize) << 8);
+            seen64[v] = true;
+        }
+        assert!(seen64.iter().all(|&b| b), "TTPF 64KB 128bpp must be a full bijection");
+
+        // RBF0 GTA6 header (0xFB 0xFF 0x01 0x00) decode test
+        let mut rbf = Vec::new();
+        rbf.extend_from_slice(b"RBF0");
+        rbf.extend_from_slice(&[0xFB, 0xFF, 0x01, 0x00]); // GTA6 header
+        rbf.extend_from_slice(&[0x00, 0x00, 0x04, 0x00]); // idx=0, struct, name len=4
+        rbf.extend_from_slice(b"Root");
+        rbf.extend_from_slice(&[0u8; 6]); // struct header
+        rbf.extend_from_slice(&[0x01, 0x10, 0x02, 0x00]); // idx=1, u32 attr, len=2
+        rbf.extend_from_slice(b"id");
+        rbf.extend_from_slice(&42u32.to_le_bytes());
+        rbf.extend_from_slice(&[0xFF, 0xFF]); // close Root
+        let xml = decode_rbf0(&rbf).expect("RBF0 should decode");
+        assert!(xml.contains("<Root id=\"42\" />"), "got: {xml}");
+
+        // scaleform gfx inspector test
+        let mut gfx = Vec::new();
+        gfx.extend_from_slice(b"GFX\x2a");
+        gfx.extend_from_slice(&128u32.to_le_bytes());
+        gfx.extend_from_slice(b"\0com.rockstargames.gtav.HudMap\0");
+        let dump = inspect_gfx(&gfx);
+        assert!(dump.contains("Version: 42"));
+        assert!(dump.contains("com.rockstargames.gtav.HudMap"));
+
+        // unicode 13 language gxt text table probe and decode test
+        let mut gxt = vec![0u8; 0x60];
+        gxt[0x10..0x15].copy_from_slice(b"0DRPz");
+        gxt.extend_from_slice("彩色字幕\0Привет мир\0한국어 자막\0日本語テキスト\0".as_bytes());
+        assert!(tex::probe_gxt_snippet(&gxt).is_some());
+        let txt = decode_0drpz_text(&gxt).expect("unicode gxt should decode");
+        assert!(txt.contains("彩色字幕") && txt.contains("Привет мир") && txt.contains("한국어 자막") && txt.contains("日本語テキスト"));
+
+        // small table: two strings in a pool past the bitmap end, reached only through a {u32, len, ptr} record
+        let mut small = vec![0u8; 0xC0];
+        small[0x08..0x10].copy_from_slice(&0x5000_0080u64.to_le_bytes());
+        small[0x10..0x15].copy_from_slice(b"0DRPz");
+        small[0x60..0x64].copy_from_slice(b"O\x80\x80\x80");
+        let pool = "Open the door\0テスト文字列\0".as_bytes();
+        small[0xA0..0xA4].copy_from_slice(&0x10u32.to_le_bytes());
+        small[0xA4..0xA8].copy_from_slice(&(pool.len() as u32).to_le_bytes());
+        small[0xA8..0xB0].copy_from_slice(&0x5000_00C0u64.to_le_bytes());
+        small.extend_from_slice(pool);
+        let txt = decode_0drpz_text(&small).expect("small pooled gxt should decode");
+        assert!(txt.contains("(2 strings)") && txt.contains("Open the door") && txt.contains("テスト文字列"));
+    }
+
+    /// Writes sample PNGs from a big .ttpf so decode quality can be eyeballed:
+    /// PERCY_TTPF=<file> PERCY_OUT=<dir> cargo test --release dump_ttpf_samples -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn dump_ttpf_samples() {
+        let (Ok(src), Ok(out)) = (std::env::var("PERCY_TTPF"), std::env::var("PERCY_OUT")) else { return };
+        let src = PathBuf::from(src);
+        let t = Instant::now();
+        let ix = tex::ttpf_index(&src).expect("index");
+        eprintln!("index: {} textures in {:.1}s", ix.descs.len(), t.elapsed().as_secs_f32());
+        let _ = fs::create_dir_all(&out);
+        let (mut ok, mut bcpack, mut fail) = (0, 0, 0);
+        let step = (ix.descs.len() / 60).max(1);
+        for d in ix.descs.iter().step_by(step) {
+            let t1 = Instant::now();
+            match decode_ttpf_texture(&src, d.idx) {
+                Ok(tx) => {
+                    ok += 1;
+                    let _ = export_texture_png(&tx, &Path::new(&out).join(format!("{}.png", tx.name)));
+                    if ok <= 5 { eprintln!("  {} in {} ms", tx.name, t1.elapsed().as_millis()); }
+                }
+                Err(e) if e.contains("BCPack") => bcpack += 1,
+                Err(e) => { fail += 1; eprintln!("  #{} fail: {e}", d.idx); }
+            }
+        }
+        eprintln!("ok={ok} bcpack={bcpack} fail={fail}");
+        // raw virtual dumps (whole allocation) for offline layout analysis
+        if let Ok(ids) = std::env::var("PERCY_RAW") {
+            for id in ids.split(',').filter_map(|x| x.parse::<usize>().ok()) {
+                let d = &ix.descs[id];
+                if let Ok(raw) = tex::ttpf_read_virtual(&src, &ix, d.byte_off, d.alloc_sz as usize) {
+                    let nm = format!("raw_{}_{}x{}_f{:02x}_m{}_a{}.bin", id, d.w, d.h, d.fmt_byte, d.has_mips as u8, d.alloc_sz);
+                    let _ = fs::write(Path::new(&out).join(nm), raw);
+                }
+            }
+        }
+    }
+
+    /// PERCY_RPF=<textures.rpf> PERCY_OUT=<dir>: dump every TXD texture as PNG
+    #[test]
+    #[ignore]
+    fn dump_txd_samples() {
+        let (Ok(src), Ok(out)) = (std::env::var("PERCY_RPF"), std::env::var("PERCY_OUT")) else { return };
+        let src = PathBuf::from(src);
+        let _ = fs::create_dir_all(&out);
+        let t = Instant::now();
+        let (_, entries) = scan_single_rpf(&src, None, false).unwrap();
+        let txds: Vec<_> = entries.iter().filter(|e| e.kind == "TXD").collect();
+        eprintln!("{} TXD in {:.1}s", txds.len(), t.elapsed().as_secs_f32());
+        let (mut ok, mut fail) = (0, 0);
+        for e in txds.iter().take(40) {
+            let t1 = Instant::now();
+            match decode_txd_from_rpf(&src, e.offset) {
+                Ok(v) => for (k, tx) in v.iter().enumerate().take(3) {
+                    ok += 1;
+                    let _ = export_texture_png(tx, &Path::new(&out).join(format!("{}_{k}_{}.png", e.offset, tx.name.replace(|c: char| !c.is_ascii_alphanumeric() && c != '_', "_"))));
+                    if ok < 4 { eprintln!("  {} {}x{} {} in {} ms", tx.name, tx.w, tx.h, tx.fmt_name, t1.elapsed().as_millis()); }
+                },
+                Err(er) => { fail += 1; eprintln!("  fail {}: {er}", e.name); }
+            }
+        }
+        eprintln!("ok={ok} fail={fail}");
+    }
+
+    /// Brute-force layout finder: PERCY_TTPF, PERCY_OUT, PERCY_IDS=1,2,3
+    #[test]
+    #[ignore]
+    fn ttpf_layout_search() {
+        let (Ok(src), Ok(out), Ok(ids)) = (std::env::var("PERCY_TTPF"), std::env::var("PERCY_OUT"), std::env::var("PERCY_IDS")) else { return };
+        let src = PathBuf::from(src);
+        let ix = tex::ttpf_index(&src).unwrap();
+        let _ = fs::create_dir_all(&out);
+        for id in ids.split(',').filter_map(|x| x.parse::<usize>().ok()) {
+            let d = &ix.descs[id];
+            let Ok(raw) = tex::ttpf_read_virtual(&src, &ix, d.byte_off, d.alloc_sz as usize) else { eprintln!("{id}: bcpack"); continue };
+            let mut res = Vec::new();
+            for (dxgi, bpe, is_bc) in [(98u8, 16usize, true), (71, 8, true), (77, 16, true), (80, 8, true), (83, 16, true), (95, 16, true), (28, 4, false), (61, 1, false), (49, 2, false)] {
+                let (bw, bh) = if is_bc { (d.w.div_ceil(4), d.h.div_ceil(4)) } else { (d.w, d.h) };
+                for t64 in [false, true] {
+                    if t64 && !is_bc { continue; }
+                    let pad = if t64 {
+                        let (tw, th) = if bpe == 16 { (64, 64) } else { (128, 64) };
+                        bw.div_ceil(tw) * tw * bh.div_ceil(th) * th * bpe
+                    } else { tex::padded_4kb_size(d.w, d.h, is_bc, bpe) };
+                    let mut offs = vec![0usize];
+                    if raw.len() > pad { offs.push(raw.len() - pad); }
+                    let mut o = 0x1000; while o + pad <= raw.len() && offs.len() < 40 { offs.push(o); o += 0x1000; }
+                    offs.sort(); offs.dedup();
+                    for off in offs {
+                        if off + pad > raw.len() && off != 0 { continue; }
+                        let sl = &raw[off..raw.len().min(off + pad)];
+                        let lin = if t64 { tex::deswizzle_64kb_ttpf(sl, d.w, d.h, is_bc, bpe) } else { tex::deswizzle_4kb_d(sl, d.w, d.h, is_bc, bpe) };
+                        let Some(px) = tex::decode_linear_to_rgba(&lin, d.w, d.h, dxgi) else { continue };
+                        let mut diff = 0u64;
+                        for y in 0..d.h { for x in 1..d.w {
+                            let (a, b) = (px[y * d.w + x - 1], px[y * d.w + x]);
+                            diff += (a.r() as i32 - b.r() as i32).unsigned_abs() as u64 + (a.g() as i32 - b.g() as i32).unsigned_abs() as u64;
+                        }}
+                        for y in 1..d.h { for x in 0..d.w {
+                            let (a, b) = (px[(y - 1) * d.w + x], px[y * d.w + x]);
+                            diff += (a.r() as i32 - b.r() as i32).unsigned_abs() as u64 + (a.g() as i32 - b.g() as i32).unsigned_abs() as u64;
+                        }}
+                        res.push((diff as f64 / (d.w * d.h) as f64, dxgi, t64, off, px));
+                    }
+                }
+            }
+            res.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            eprintln!("tex {id} {}x{} f{:02x} mips={} alloc={:#x}", d.w, d.h, d.fmt_byte, d.has_mips, d.alloc_sz);
+            for (k, (sc, dx, t64, off, px)) in res.iter().take(4).enumerate() {
+                eprintln!("   score {sc:.1} dxgi {dx} t64 {t64} off {off:#x}");
+                let t = tex::DecodedTexture { name: String::new(), w: d.w, h: d.h, mips: 1, dxgi: *dx, fmt_name: "", pixels: px.clone(), raw_dds_payload: vec![] };
+                let _ = export_texture_png(&t, &Path::new(&out).join(format!("{id}_{k}.png")));
+            }
+        }
+    }
+
+    #[test]
+    fn real_gta6_archives_smoke_test() {
+        let base = Path::new(r"D:\Grand Theft Auto VI Build");
+        if !base.exists() { return; }
+
+        // 1. TTPF native scan + decode
+        let ttpf = base.join("data").join("ttdb").join("ui").join("platform.ttpf");
+        if ttpf.exists() {
+            let (info, descs) = scan_ttpf_descriptors(&ttpf).expect("scan platform.ttpf");
+            assert!(!descs.is_empty(), "platform.ttpf descriptors empty: {info}");
+            let mut decoded_ok = 0usize;
+            for d in descs.iter().take(25) {
+                if let Ok(t) = decode_ttpf_texture(&ttpf, d.idx) {
+                    assert_eq!(t.pixels.len(), t.w * t.h);
+                    decoded_ok += 1;
+                    if decoded_ok >= 3 { break; }
+                }
+            }
+            assert!(decoded_ok >= 1, "expected at least 1 decoded texture from platform.ttpf");
+        }
+
+        // 1b. Previously unsupported TTPF formats: DXGI 28 (RGBA8), 54 (R16F), 61 (R8), 65 (A8), 87 (BGRA8), 96 (BC6H_SF16)
+        for (rel, idx, exp_dxgi) in [
+            ("data\\ttdb\\graphics\\ttdb_graphics.ttpf", 1usize, 28u8),
+            ("data\\ttdb\\graphics\\ttdb_graphics.ttpf", 563usize, 87u8),
+            ("data\\ttdb\\maps\\ttdb_maps_0_7.ttpf", 605usize, 54u8),
+            ("data\\ttdb\\interiors\\ttdb_interiors_0_3.ttpf", 1984usize, 65u8),
+            ("data\\ttdb\\vfx\\ttdb_vfx.ttpf", 608usize, 61u8),
+            ("data\\ttdb\\lighting\\lighting.ttpf", 334usize, 96u8),
+        ] {
+            let p = base.join(rel);
+            if p.exists() {
+                let t = decode_ttpf_texture(&p, idx).unwrap_or_else(|e| panic!("{rel} #{idx}: {e}"));
+                assert_eq!(t.dxgi, exp_dxgi);
+                assert_eq!(t.pixels.len(), t.w * t.h);
+            }
+        }
+
+        // 2. TXD native scan + decode from textures.rpf
+        let tex_rpf = base.join("textures.rpf");
+        if tex_rpf.exists() {
+            let (_, entries) = scan_single_rpf(&tex_rpf, None, false).expect("scan textures.rpf");
+            let txds: Vec<&RpfEntry> = entries.iter().filter(|e| e.kind == "TXD").collect();
+            assert!(!txds.is_empty(), "textures.rpf should yield TXD entries");
+            let t0 = decode_txd_from_rpf(&tex_rpf, txds[0].offset).expect("decode first TXD");
+            assert!(!t0.is_empty());
+            assert_eq!(t0[0].pixels.len(), t0[0].w * t0[0].h);
+        }
+
+        // 3. CNavMesh 3D decode from navmeshes.rpf (first CNavMesh block starts at ~750MB after path regions)
+        let nav_rpf = base.join("navmeshes.rpf");
+        if nav_rpf.exists() {
+            let mut f = File::open(&nav_rpf).unwrap();
+            let base_off = 786_010_112u64; // page holding first CNavMesh tile (786010128 - 0x10)
+            f.seek(SeekFrom::Start(base_off)).unwrap();
+            let mut buf = vec![0u8; 256 * 1024];
+            let n = f.read(&mut buf).unwrap();
+            let mut dec = Decompress::new(true);
+            let mut out = vec![0u8; 32768];
+            let e = probe_rage9_page(&buf, 0, n, base_off, &nav_rpf, "navmeshes.rpf", &mut dec, &mut out)
+                .expect("should detect NAVM in navmeshes.rpf");
+            assert_eq!(e.kind, "NAVM");
+            assert!(e.name.starts_with("nav_160_179_"), "got {}", e.name);
+            let mesh = decode_navmesh_from_rpf(&nav_rpf, e.offset, &e.name).expect("decode NAVM mesh");
+            assert!(!mesh.verts.is_empty() && !mesh.tris.is_empty());
+        }
+
+        // 4. packs.rpf catalog model decode (verifies +0xA8 name + SW_4KB_D embedded tex)
+        let packs_rpf = base.join("packs.rpf");
+        if packs_rpf.exists() {
+            let mesh = decode_rage9_model_from_rpf(&packs_rpf, 0x47ab1010, "fallback").expect("decode packs.rpf model");
+            assert!(!mesh.verts.is_empty() && !mesh.tris.is_empty());
+        }
+    }
+
+    #[test]
+    fn multi_select_click_ctrl_shift_works() {
+        let view = [10usize, 20, 30, 40, 50];
+        let mut multi = HashSet::new();
+        let mut anchor = None;
+
+        // Plain click selects one and sets anchor
+        apply_multi_select(&view, &mut multi, &mut anchor, 20, false, false);
+        assert_eq!(multi, HashSet::from([20]));
+        assert_eq!(anchor, Some(20));
+
+        // Shift+click selects contiguous range in view order (20..=40)
+        apply_multi_select(&view, &mut multi, &mut anchor, 40, false, true);
+        assert_eq!(multi, HashSet::from([20, 30, 40]));
+        assert_eq!(anchor, Some(20));
+
+        // Ctrl+click toggles individual item
+        apply_multi_select(&view, &mut multi, &mut anchor, 30, true, false);
+        assert_eq!(multi, HashSet::from([20, 40]));
+        assert_eq!(anchor, Some(30));
+
+        // Ctrl+click adds another item
+        apply_multi_select(&view, &mut multi, &mut anchor, 10, true, false);
+        assert_eq!(multi, HashSet::from([10, 20, 40]));
+
+        // Plain click resets to single item
+        apply_multi_select(&view, &mut multi, &mut anchor, 50, false, false);
+        assert_eq!(multi, HashSet::from([50]));
+        assert_eq!(anchor, Some(50));
+    }
+
+    #[test]
+    fn multi_copy_formats_multiple_entries() {
+        let e1 = RpfEntry {
+            source_rpf: PathBuf::from("packs.rpf"),
+            rpf_name: "packs.rpf".into(),
+            name: "alpha.#ft".into(),
+            kind: "VEH",
+            offset: 0x1000,
+            comp_size: 64,
+            raw_size: 128,
+            tracks: 0,
+            chunks: vec![],
+        };
+        let e2 = RpfEntry {
+            source_rpf: PathBuf::from("textures.rpf"),
+            rpf_name: "textures.rpf".into(),
+            name: "beta.#td".into(),
+            kind: "TXD",
+            offset: 0x20a0,
+            comp_size: 128,
+            raw_size: 256,
+            tracks: 0,
+            chunks: vec![],
+        };
+        let list = [&e1, &e2];
+        assert_eq!(format_multi_copy(&list, 0), "alpha.#ft\nbeta.#td");
+        assert_eq!(
+            format_multi_copy(&list, 1),
+            "packs.rpf / alpha.#ft\ntextures.rpf / beta.#td"
+        );
+        assert_eq!(
+            format_multi_copy(&list, 2),
+            "packs.rpf @ 0x00001000 (alpha.#ft)\ntextures.rpf @ 0x000020a0 (beta.#td)"
+        );
+    }
 }

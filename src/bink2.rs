@@ -84,7 +84,7 @@ mod imp {
                     bink_do(hbink);
                     bink_copy(hbink, buf.as_mut_ptr(), stride as i32, info.height, 0, 0, BINKSURFACE32);
                 }
-                for px in buf.chunks_exact_mut(4) {
+                for px in buf.as_chunks_mut::<4>().0 {
                     px.swap(0, 2); // BGRx -> RGBx
                     px[3] = 255;
                 }

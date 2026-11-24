@@ -375,7 +375,155 @@ mod backend {
     }
 }
 
-#[cfg(not(windows))]
+/// Fast fixed-point Q15 PCM volume scaling for Unix command-line players without volume flags.
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn scale_pcm(samples: &[i16], volume: f32) -> Vec<i16> {
+    let v = volume.clamp(0.0, 1.0);
+    if v >= 0.999 {
+        return samples.to_vec();
+    }
+    let q15 = (v * 32768.0).round() as i32;
+    samples.iter().map(|&s| ((s as i32 * q15) >> 15) as i16).collect()
+}
+
+#[cfg(unix)]
+mod backend {
+    use std::path::PathBuf;
+    use std::process::{Child, Command, Stdio};
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    pub struct WaveOutHandle {
+        samples: Arc<Vec<i16>>,
+        channels: u16,
+        start_frame: usize,
+        total_frames: usize,
+        sample_rate: u32,
+        volume: f32,
+        started_at: Instant,
+        paused_frame: Option<usize>,
+        child: Option<Child>,
+        wav_path: PathBuf,
+    }
+
+    impl Drop for WaveOutHandle {
+        fn drop(&mut self) {
+            self.stop_child();
+            let _ = std::fs::remove_file(&self.wav_path);
+        }
+    }
+
+    impl WaveOutHandle {
+        fn stop_child(&mut self) {
+            if let Some(mut c) = self.child.take() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+
+        fn spawn_from(&mut self, from: usize) -> Result<(), String> {
+            self.stop_child();
+            let ch = self.channels.max(1) as usize;
+            let sample_off = (from * ch).min(self.samples.len());
+            if sample_off >= self.samples.len() {
+                return Ok(());
+            }
+            #[cfg(target_os = "macos")]
+            {
+                crate::awc::write_pcm_wav(&self.wav_path, self.sample_rate, self.channels, &self.samples[sample_off..])
+                    .map_err(|e| e.to_string())?;
+                self.child = Some(
+                    Command::new("afplay")
+                        .args(["-v", &format!("{:.3}", self.volume.clamp(0.0, 1.0))])
+                        .arg(&self.wav_path)
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .map_err(|e| format!("afplay: {e}"))?,
+                );
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let pcm = super::scale_pcm(&self.samples[sample_off..], self.volume);
+                crate::awc::write_pcm_wav(&self.wav_path, self.sample_rate, self.channels, &pcm)
+                    .map_err(|e| e.to_string())?;
+                let mut launched = None;
+                for (player, args) in [("pw-play", &[][..]), ("paplay", &[][..]), ("aplay", &["-q"][..])] {
+                    match Command::new(player)
+                        .args(args.iter())
+                        .arg(&self.wav_path)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                    {
+                        Ok(c) => { launched = Some(c); break; }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(e) => return Err(format!("{player}: {e}")),
+                    }
+                }
+                self.child = Some(launched.ok_or_else(|| {
+                    "No audio player found (install pw-play, paplay, or aplay)".to_string()
+                })?);
+            }
+            self.started_at = Instant::now();
+            Ok(())
+        }
+
+        pub fn play_from(samples: Arc<Vec<i16>>, sample_rate: u32, channels: u16, start_frame: usize, volume: f32) -> Result<Self, String> {
+            let ch = channels.max(1) as usize;
+            let total_frames = samples.len() / ch;
+            let wav_path = std::env::temp_dir().join(format!("percystar_audio_{}.wav", std::process::id()));
+            let mut h = Self {
+                samples,
+                channels: channels.max(1),
+                start_frame: start_frame.min(total_frames),
+                total_frames,
+                sample_rate: sample_rate.max(1),
+                volume,
+                started_at: Instant::now(),
+                paused_frame: None,
+                child: None,
+                wav_path,
+            };
+            h.spawn_from(h.start_frame)?;
+            Ok(h)
+        }
+
+        pub fn set_volume(&mut self, volume: f32) {
+            self.volume = volume.clamp(0.0, 1.0);
+            if self.paused_frame.is_none() {
+                let (cur, _) = self.current_frame();
+                self.start_frame = cur;
+                let _ = self.spawn_from(cur);
+            }
+        }
+
+        pub fn pause(&mut self) {
+            let (cur, _) = self.current_frame();
+            self.paused_frame = Some(cur);
+            self.stop_child();
+        }
+
+        pub fn resume(&mut self) {
+            if let Some(f) = self.paused_frame.take() {
+                self.start_frame = f;
+                let _ = self.spawn_from(f);
+            }
+        }
+
+        pub fn current_frame(&mut self) -> (usize, bool) {
+            if let Some(f) = self.paused_frame {
+                return (f, f >= self.total_frames);
+            }
+            let elapsed = self.started_at.elapsed().as_secs_f64();
+            let cur = (self.start_frame + (elapsed * self.sample_rate as f64) as usize).min(self.total_frames);
+            (cur, cur >= self.total_frames)
+        }
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
 mod backend {
     use std::time::Instant;
 
@@ -590,7 +738,11 @@ impl AudioPlayerState {
         *pending.lock().unwrap() = None;
         std::thread::spawn(move || {
             let res = awc::decode_single_awc_chunk(&raw, coff, csz, sub_stream).map(|(_, pcm)| pcm);
-            *pending.lock().unwrap() = Some((gen, idx, res));
+            // a slower older request must not replace the result of a newer one or the player waits forever
+            let mut slot = pending.lock().unwrap();
+            if slot.as_ref().map_or(true, |(newest, _, _)| *newest <= gen) {
+                *slot = Some((gen, idx, res));
+            }
         });
     }
 

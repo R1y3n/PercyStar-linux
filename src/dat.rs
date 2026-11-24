@@ -58,7 +58,7 @@ fn is_zlib_hdr(d: &[u8]) -> bool {
     }
     let b0 = d[0] as u16;
     let b1 = d[1] as u16;
-    b0 == 0x78 && matches!(b1, 0x01 | 0x5E | 0x9C | 0xDA) && ((b0 << 8) | b1) % 31 == 0
+    b0 == 0x78 && matches!(b1, 0x01 | 0x5E | 0x9C | 0xDA) && ((b0 << 8) | b1).is_multiple_of(31)
 }
 
 fn known_pack_fallback(pack_hash: u32) -> Option<&'static str> {
@@ -172,7 +172,8 @@ pub fn parse_audio_rpf_catalog(audio_rpf: &Path, first_awc_off: u64) -> Option<A
                         if let Some(stripped) = s.strip_prefix("Core.").or_else(|| s.strip_prefix("core.")) {
                             hash_dict.entry(joaat(stripped)).or_insert_with(|| stripped.to_string());
                         }
-                        if s.contains('.') {
+                        // every sub range of the dotted parts is hashed long runs would be quadratic
+                        if s.contains('.') && s.len() <= 128 && s.bytes().filter(|&c| c == b'.').count() < 8 {
                             let parts: Vec<&str> = s.split('.').collect();
                             for a in 0..parts.len() {
                                 for b_idx in (a + 1)..=parts.len() {

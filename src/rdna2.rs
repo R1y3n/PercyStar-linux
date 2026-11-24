@@ -92,14 +92,15 @@ pub struct Ps09Cache {
 }
 
 fn rd32(b: &[u8], off: usize) -> u32 {
-    if off + 4 > b.len() {
+    // offsets are derived from file values the sum must not wrap
+    if off.checked_add(4).map_or(true, |end| end > b.len()) {
         return 0;
     }
     u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
 }
 
 fn rd64(b: &[u8], off: usize) -> u64 {
-    if off + 8 > b.len() {
+    if off.checked_add(8).map_or(true, |end| end > b.len()) {
         return 0;
     }
     u64::from_le_bytes([
@@ -157,13 +158,13 @@ fn parse_bindings(meta_slice: &[u8]) -> Vec<ResourceBinding> {
 /// Detect exact code base: normally `off_meta + meta_size`, but gracefully handles partial
 /// chunk dumps that dropped chunks before code start by checking shader[0..2] alignment.
 fn locate_code_base(data: &[u8], off_c3: usize, c3: u32, expected: usize) -> usize {
-    if expected + 16 <= data.len() && rd32(data, expected + 0x18) == 0xD580_0000 {
+    if expected.checked_add(0x1c).is_some_and(|end| end <= data.len()) && rd32(data, expected + 0x18) == 0xD580_0000 {
         return expected;
     }
     // Check aligned offsets near expected (e.g., -64KB if a chunk was missing in extracted dir)
     for delta in [0isize, -0x10000, 0x10000, -0x20000, 0x20000] {
-        let cand = (expected as isize + delta) as usize;
-        if cand + 0x28 <= data.len()
+        let Some(cand) = expected.checked_add_signed(delta) else { continue };
+        if cand.checked_add(0x28).is_some_and(|end| end <= data.len())
             && (rd32(data, cand + 0x18) == 0xD580_0000 || rd32(data, cand + 0x24) == 0xBFA0_0003)
         {
             return cand;
@@ -891,7 +892,7 @@ pub fn decode_gfx103(code: &[u8], max_insns: usize) -> Vec<DecodedInsn> {
                 format!("v{vdst}, {s0}, {s1}")
             };
             (mn.to_string(), ops, kind)
-        } else if matches!(enc6, 0x35 | 0x34 | 0x38 | 0x39 | 0x36 | 0x37) {
+        } else if matches!(enc6, 0x34..=0x39) {
             let fam = match enc6 {
                 0x35 => "vop3",
                 0x34 => "vop3p",
@@ -1222,7 +1223,7 @@ fn push_spv_op(words: &mut Vec<u32>, opcode: u16, operands: &[u32]) {
 
 fn push_spv_str(words: &mut Vec<u32>, opcode: u16, prefix: &[u32], text: &str, suffix: &[u32]) {
     let bytes = text.as_bytes();
-    let str_words = (bytes.len() + 1 + 3) / 4;
+    let str_words = (bytes.len() + 1).div_ceil(4);
     let wc = (1 + prefix.len() + str_words + suffix.len()) as u32;
     words.push((wc << 16) | (opcode as u32));
     words.extend_from_slice(prefix);
@@ -1454,6 +1455,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn code_base_search_survives_offsets_near_the_address_space_end() {
+        // expected plus the probe deltas used to wrap and index far out of bounds
+        let data = vec![0u8; 128];
+        for expected in [0usize, 0xFFE4, 0x1_FFE4, usize::MAX - 8, usize::MAX] {
+            let _ = locate_code_base(&data, 0, 0, expected);
+        }
+        assert_eq!(rd32(&data, usize::MAX - 2), 0);
+        assert_eq!(rd64(&data, usize::MAX - 6), 0);
+        assert_eq!(rd32(&[1, 0, 0, 0], 0), 1);
+    }
+
+    #[test]
     fn decodes_and_lifts_real_gfx103_tent_filter_snippet() {
         // Real GFX10.3 dwords observed in GTA VI shaders.rpf:
         // v_rcp_f32 v5, s17; v_add_f32 v3, 0.5, v3; v_mul_f32 v4, v4, v2;
@@ -1503,7 +1516,7 @@ mod tests {
         assert!(hlsl.contains("mrt0 = float4("));
 
         let spv = lift_to_spirv(&entry, &bytes);
-        assert!(spv.len() >= 20 && spv.len() % 4 == 0);
+        assert!(spv.len() >= 20 && spv.len().is_multiple_of(4));
         assert_eq!(u32::from_le_bytes([spv[0], spv[1], spv[2], spv[3]]), 0x0723_0203);
     }
 }
