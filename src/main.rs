@@ -174,8 +174,8 @@ pub fn move_window(hwnd: isize, x: i32, y: i32, w: i32, h: i32) {
 // macos/linux: no HWND docking, binkplay launched as a separate window, wav via afplay/aplay
 #[cfg(not(windows))]
 mod plat {
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::path::PathBuf;
+use std::process::Child;
 use std::sync::Mutex;
 
 static WAV_PROC: Mutex<Option<Child>> = Mutex::new(None);

@@ -68,7 +68,7 @@ pub fn run(base: &Path, runs: usize, only: &str) {
     for name in ["script.rpf", "common.rpf", "textures.rpf", "shaders.rpf", "data.rpf", "packs.rpf"] {
         let p = base.join(name);
         if want(name) && p.exists() {
-            let (_, e) = time(&format!("scan: {name}"), runs, || scan_single_rpf(&p, None).unwrap_or_default());
+            let (_, e) = time(&format!("scan: {name}"), runs, || scan_single_rpf(&p, None, false).unwrap_or_default());
             println!("  ({} entries, digest {:016x})", e.len(), digest(&e));
             scans.insert(name, e);
         }

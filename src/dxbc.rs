@@ -1,4 +1,5 @@
 use flate2::read::ZlibDecoder;
+#[cfg(windows)]
 use std::ffi::c_void;
 use std::fmt::Write as _;
 use std::io::Read;
