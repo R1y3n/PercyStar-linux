@@ -3,7 +3,7 @@
 <p>
   <img src="https://img.shields.io/badge/Platform-Linux%20x64-FCC624?style=flat-square&logo=linux&logoColor=black" alt="Linux" />
   <img src="https://img.shields.io/badge/Build-GitHub%20Actions-2088FF?style=flat-square&logo=githubactions&logoColor=white" alt="GitHub Actions" />
-  <img src="https://img.shields.io/badge/Version-v1.6.0-FFA81C?style=flat-square" alt="Version" />
+  <img src="https://img.shields.io/badge/Version-v1.7.0-FFA81C?style=flat-square" alt="Version" />
   <img src="https://img.shields.io/badge/License-PercyStar%20Attribution%20(%40rpatty)-red?style=flat-square" alt="License" />
 </p>
 
@@ -11,7 +11,7 @@ Linux fork of [rpatty-dev/PercyStar](https://github.com/rpatty-dev/PercyStar). T
 
 ## Latest release
 
-- **[v1.6.0-linux](https://github.com/R1y3n/PercyStar-linux/releases/tag/v1.6.0-linux)** - Linux tarball + AppImage (upstream v1.6.0)
+- **[v1.7.0-linux](https://github.com/R1y3n/PercyStar-linux/releases/tag/v1.7.0-linux)** - Linux tarball + AppImage (upstream v1.7.0)
 
 Download from the [Releases page](https://github.com/R1y3n/PercyStar-linux/releases).
 
@@ -21,10 +21,12 @@ Download from the [Releases page](https://github.com/R1y3n/PercyStar-linux/relea
 - AppImage packaging (`linuxdeploy` + `appimagetool`) for easier distribution.
 - GTK3 file dialog backend on Linux (`rfd`).
 - Offline mode: startup update check and in-app update UI disabled.
+- Linux-native Bink video playback: extracts Bink frames in-process instead of shelling out to Windows-only `binkplay.exe`.
+- 3D model viewer applies discovered TXD/TTPF textures to the rasterizer instead of leaving models untextured.
 - RPF scan improvements: skip already-identified zlib offsets in the second pass and lower idle model-viewer RAM.
 - Scan regression fix so second-pass entries (XML/RBF0/GXT/PSIN/DAT/ZLIB/bin, etc.) are found again for <=512MB archives.
 - `--scan` CLI mode for searching archives without launching the GUI.
-- Tracks upstream v1.6.0: BCPack BC1-BC5 textures, a smooth filtered model renderer with OBJ/MTL/GLB export, GXT/PSIN tree viewers, batch audio/navmesh CLI tools, and world viewer improvements.
+- Tracks upstream v1.7.0: SGD5 effect browser and native shader metadata, streaming GXT discovery, GXT empty-row preservation, faster Bink playback, BCPack BC1-BC5 textures, smooth filtered model renderer with OBJ/MTL/GLB export, and world viewer improvements.
 
 ## Downloads
 
@@ -57,7 +59,7 @@ Options:
 
 ## Upstream sync
 
-This fork tracks upstream `rpatty-dev/PercyStar`. All upstream commits through `v1.6.0` are merged into `linux-build`; Linux-specific build, offline, scanner and CLI changes were re-applied on top. Upstream README-only changes are not copied over this Linux-focused README.
+This fork tracks upstream `rpatty-dev/PercyStar`. All upstream commits through `v1.7.0` are merged into `linux-build`; Linux-specific build, offline, scanner, video and texture changes were re-applied on top. Upstream README-only changes are not copied over this Linux-focused README.
 
 ---
 
@@ -74,12 +76,21 @@ PercyStar/
 │   ├── awc_extract.py      # Standalone CLI ADAT (.awc) Opus -> .wav helper
 │   └── rpf9_carve.py       # Standalone CLI RPF9 carver
 ├── docs/
-│   └── breakthroughs.json  # Research/breakthroughs feed
+│   ├── breakthroughs.json  # Research/breakthroughs feed
+│   ├── FSSM.md             # Native shader metadata format
+│   ├── SGD5.md             # Shader-group container notes
+│   ├── SGD5-layout.md      # SGD5 binary layout
+│   └── SGD5-pipeline.md    # SGD5 decode pipeline
 ├── src/
 │   ├── main.rs             # PercyStar egui app, scanners, viewers, CLI
 │   ├── rdna2.rs            # RDNA2 PS\x00\x09 parser/disassembler/lifter
 │   ├── sgd5.rs             # SGD5 shader-group container & DXBC/FSSM extractor
+│   ├── sgd5_metadata.rs    # SGD5 runtime metadata decoder
+│   ├── sgd5_view.rs        # SGD5 effect hierarchy browser
 │   ├── dxbc.rs             # DXBC / NOBC / FSSM RDNA2 shader disassembler
+│   ├── dxbc/compact_root.rs # DXBC compact root signature parser
+│   ├── dxbc/fssm.rs        # Native shader metadata parser
+│   ├── gxt_scan.rs         # Streaming GXT discovery in large archives
 │   ├── psin.rs             # PSIN binary PSO schema, enum & instance decoder
 │   ├── anim.rs             # crClipDictionary (0DRPz) animation header decoder
 │   ├── dat.rs              # RAGE 9 audio metadata (DAT25/26/41/61) decoder
@@ -102,6 +113,7 @@ PercyStar/
 │   ├── meta7a.rs           # 0x7a metadata parser
 │   └── vehicle_variations.rs # Vehicle variation/preset helpers
 ├── .github/workflows/linux-build.yml # Linux tarball + AppImage CI
+├── .github/workflows/publish-release.yml # Publishes release assets from Actions artifacts
 ├── app.rc / build.rs       # Win32 icon resource
 ├── Cargo.toml / Cargo.lock # Pinned Rust dependencies
 └── LICENSE
@@ -128,7 +140,9 @@ Binary: `target/release/PercyStar`.
   - [@clayeon](https://github.com/clayeon) (PR #34) — Emergency lights with siren sequencer timing, modular fragment/roofbar composition, and `packs.rpf` `0x7a` authored vehicle configurations.
   - [@Snorps37](https://github.com/Snorps37) (PR #56, Issue #55) — GXT small-table decoding through string pool records.
   - [@worstgirlinamerica](https://github.com/worstgirlinamerica) (PRs #30-#33, #57) — `scripts/build_linux.sh`, ADAT misaligned stream-table recovery, AWC superblock directory & stereo channel fix in `awc_extract.py`, `cfg(windows)` gating, and explicit `f32` literal fix.
-  - [@Xyzstk](https://github.com/Xyzstk) (PRs #8, #29) — `SGD5` shader-group parser, `DXBC`/`FSSM` extraction, and reflection resource naming.
+  - [@Xyzstk](https://github.com/Xyzstk) (PRs #8, #29, #59) — `SGD5` shader-group parser, `DXBC`/`FSSM` extraction, reflection resource naming, and SGD5 effect hierarchy browsing.
+  - [@lalitshankarch](https://github.com/lalitshankarch) (PR #58) — Native shader variants and verified compiler metadata.
+  - [@kaoru-maki](https://github.com/kaoru-maki) (PRs #60, #61) — Streaming GXT discovery and empty-row preservation in typed GXT tables.
   - [@techfoundrynz](https://github.com/techfoundrynz) (PRs #12, #13, #21–#28) — `>4 GiB` TTPF addressing, format 99 `float3` meshlets, world-scale MHIU terrain in GPU World, north-up 2D map & heightmap alignment, Model Viewer sidebar stability, window/taskbar icons, startup feedback, and `Cargo.lock` sync.
   - [@asm512](https://github.com/asm512) (PRs #19, #43, #45, #47, #51, #52, #54) — World viewer model eviction & off-thread mesh prep, PSIN tree view, GXT text export & search, PSIN typed XML, vehicle data panel, in-file/sibling vehicle LOD switching, and stale-decode/streamer fixes.
   - `@igvcc` (Discord) — Bink2 container parser, BCPack Row-3 base-seed fallback, and `--decode-audio` / `--decode-navmesh` batch CLI tools.

@@ -26,7 +26,7 @@ fn rf32(b: &[u8], o: usize) -> f32 {
     f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
 }
 #[inline]
-fn vptr(q: u64) -> Option<usize> {
+pub(crate) fn vptr(q: u64) -> Option<usize> {
     (0x5000_0000..0x5800_0000).contains(&q).then(|| (q - 0x5000_0000) as usize)
 }
 #[inline]
@@ -1671,8 +1671,119 @@ fn gxt_pool_strings(data: &[u8]) -> Vec<String> {
     pools.into_iter().flat_map(|(_, s)| s).filter(|s| !s.is_empty()).collect()
 }
 
+// A typed zldbmt resource stores one reference per row. The referenced strings
+// may be empty, repeated, or outside the range scanned by the legacy heuristic.
+pub(crate) fn gxt_row_descriptor(data: &[u8]) -> Option<usize> {
+    if data.len() < 0x60 || &data[0x10..0x15] != b"0DRPz" {
+        return None;
+    }
+    let offset = vptr(ru64(data, 0x38))?;
+    let descriptor = data.get(offset..offset + 16)?;
+    (ru32(descriptor, 0) == 0xa847_8889).then_some(offset)
+}
+
+pub(crate) fn gxt_referenced_rows(data: &[u8], descriptor: usize) -> Option<Vec<&str>> {
+    let row_bytes = ru32(data, descriptor + 4) as usize;
+    let row_start = vptr(ru64(data, descriptor + 8))?;
+    if row_bytes % 16 != 0 {
+        return None;
+    }
+    let rows = data.get(row_start..row_start.checked_add(row_bytes)?)?;
+    let mut strings = Vec::with_capacity(rows.len() / 16);
+    for row in rows.chunks_exact(16) {
+        let reference = ru64(row, 8);
+        let page = (reference & 0x000f_ffff) as usize;
+        let offset = usize::try_from(reference >> 20).ok()?;
+        let page_descriptor = descriptor + page.checked_sub(1)? * 16;
+        let page_descriptor = data.get(page_descriptor..page_descriptor + 16)?;
+        if ru32(page_descriptor, 0) != 0x10 {
+            return None;
+        }
+        let pool_start = vptr(ru64(page_descriptor, 8))?;
+        let pool_bytes = ru32(page_descriptor, 4) as usize;
+        let pool = data.get(pool_start..pool_start.checked_add(pool_bytes)?)?;
+        let remaining = pool.get(offset..)?;
+        let end = remaining.iter().position(|&byte| byte == 0)?;
+        strings.push(std::str::from_utf8(&remaining[..end]).ok()?);
+    }
+    Some(strings)
+}
+
+#[cfg(test)]
+mod gxt_row_tests {
+    use super::*;
+
+    fn table() -> Vec<u8> {
+        let mut data = vec![0; 0xf0];
+        data[0x10..0x15].copy_from_slice(b"0DRPz");
+        data[0x38..0x40].copy_from_slice(&0x5000_0060u64.to_le_bytes());
+        data[0x60..0x64].copy_from_slice(&0xa847_8889u32.to_le_bytes());
+        data[0x64..0x68].copy_from_slice(&64u32.to_le_bytes());
+        data[0x68..0x70].copy_from_slice(&0x5000_00a0u64.to_le_bytes());
+        let pool = b"!\0\0  A  \0unused\0";
+        data[0x90..0x94].copy_from_slice(&0x10u32.to_le_bytes());
+        data[0x94..0x98].copy_from_slice(&(pool.len() as u32).to_le_bytes());
+        data[0x98..0xa0].copy_from_slice(&0x5000_00f0u64.to_le_bytes());
+        for (index, offset) in [0u64, 2, 0, 3].into_iter().enumerate() {
+            let at = 0xa8 + index * 16;
+            data[at..at + 8].copy_from_slice(&((offset << 20) | 4).to_le_bytes());
+        }
+        data.extend_from_slice(pool);
+        data
+    }
+
+    #[test]
+    fn preserves_every_referenced_row_including_blanks_and_repeats() {
+        assert_eq!(decode_0drpz_text(&table()).as_deref(),
+                   Some("=== RAGE9 Text Table (4 strings) ===\n\n!\n\n!\n  A  "));
+    }
+
+    #[test]
+    fn preserves_an_all_empty_table() {
+        let mut data = table();
+        for index in 0..4 {
+            let at = 0xa8 + index * 16;
+            data[at..at + 8].copy_from_slice(&((2u64 << 20) | 4).to_le_bytes());
+        }
+        assert_eq!(
+            decode_0drpz_text(&data).as_deref(),
+            Some("=== RAGE9 Text Table (4 strings) ===\n\n\n\n\n")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_typed_references() {
+        let mut wrong_page = table();
+        wrong_page[0x90..0x94].copy_from_slice(&0x11u32.to_le_bytes());
+        assert!(decode_0drpz_text(&wrong_page).is_none());
+
+        let mut bad_offset = table();
+        bad_offset[0xa8..0xb0].copy_from_slice(&((60u64 << 20) | 4).to_le_bytes());
+        assert!(decode_0drpz_text(&bad_offset).is_none());
+
+        let mut truncated = table();
+        truncated.pop();
+        assert!(decode_0drpz_text(&truncated).is_none());
+
+        let mut bad_utf8 = table();
+        bad_utf8[0xf0] = 0x80;
+        assert!(decode_0drpz_text(&bad_utf8).is_none());
+    }
+
+    #[test]
+    fn keeps_legacy_decoding_for_untyped_payloads() {
+        let data = b"First line\0Second line\0Third line\0";
+        assert_eq!(decode_0drpz_text(data).as_deref(),
+                   Some("=== RAGE9 Text Table (3 strings) ===\n\nFirst line\nSecond line\nThird line"));
+    }
+}
+
 // extract clean readable utf8 strings from a rage9 0drpz localization text table across all 13 languages
 pub fn decode_0drpz_text(data: &[u8]) -> Option<String> {
+    if let Some(descriptor) = gxt_row_descriptor(data) {
+        let rows = gxt_referenced_rows(data, descriptor)?;
+        return Some(format!("=== RAGE9 Text Table ({} strings) ===\n\n{}", rows.len(), rows.join("\n")));
+    }
     let start = if data.len() >= 0x60 && &data[0x10..0x15] == b"0DRPz" { 0x60 } else { 0 };
     let end = if start == 0x60 {
         let bmap = ru64(data, 8);
