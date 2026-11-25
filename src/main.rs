@@ -5342,7 +5342,7 @@ impl eframe::App for Rpf9App {
                 self.rebuild_vehicle_parts();
             }
             if let Some(result) = m.loaded_model_textures.take() {
-                let applied = if result.entry == self.model_entry {
+                let applied = if Some(result.entry) == self.model_entry {
                     self.mesh3d.as_mut().map(|mesh| mesh.apply_browser_textures(&result.textures)).unwrap_or(0)
                 } else {
                     0
