@@ -60,16 +60,18 @@ jobs:
           else
             notes=$(mktemp)
             cat > "$notes" <<'NOTES'
-          Linux build of upstream PercyStar v1.6.0 with fork-specific build, offline and scanner changes.
+          Linux build of upstream PercyStar v1.7.0 with fork-specific build, offline and scanner changes.
 
-          - All upstream commits through v1.6.0 are merged (`behind_by: 0`).
+          - All upstream commits through v1.7.0 are merged (`behind_by: 0`).
           - Linux x64 binary built on Ubuntu 22.04 (glibc 2.35+).
           - AppImage built with linuxdeploy + appimagetool; GIO module mismatch fixed.
           - GTK3 file dialogs via `rfd`; startup update check and updater UI disabled.
+          - Linux video playback without `binkplay.exe`/RAD Video Tools: uses local `mpv`, `ffplay`, VLC or MPlayer (`PERCYSTAR_VIDEO_PLAYER` overrides), plus a native `--inspect-bk2` container report.
+          - Model Texture Browser textures are now bound into the rasterizer's material layers and override embedded whole-mesh textures.
           - `--scan` CLI with `--name`, `--type`, `--min-size`, `--max-size`, `--limit`, `--json`.
           - Scanner deduplicates claimed zlib offsets and uses a smaller whole-file threshold for CLI scans.
           - Idle model-viewer raster buffers are released to lower RAM use.
-          - Upstream v1.6.0 features included: BCPack BC1-BC5 textures, smooth filtered renderer, OBJ/MTL/GLB export, GXT/PSIN tree viewers, batch audio/navmesh CLI, world viewer improvements.
+          - Upstream v1.7.0 features included: SGD5 effect browser and native shader metadata, streaming GXT discovery, GXT empty-row preservation, faster Bink playback, BCPack BC1-BC5 textures, smooth filtered renderer with OBJ/MTL/GLB export, and world viewer improvements.
 
           Assets: `PercyStar-linux-x64.tar.gz` and `PercyStar-linux-x86_64.AppImage`.
           NOTES
