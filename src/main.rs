@@ -208,7 +208,7 @@ pub fn move_window(hwnd: isize, x: i32, y: i32, w: i32, h: i32) {
 }
 }
 
-// macos/linux: no HWND docking, binkplay launched as a separate window, wav via afplay/aplay
+// macos/linux: no HWND docking, locally installed video player launched as a separate window, wav via afplay/aplay
 #[cfg(not(windows))]
 mod plat {
 use std::path::PathBuf;
@@ -222,14 +222,6 @@ pub fn dock_child_hwnd(_c: isize, _p: isize, _x: i32, _y: i32, _w: i32, _h: i32)
 pub fn active_window() -> isize { 0 }
 pub fn move_window(_hwnd: isize, _x: i32, _y: i32, _w: i32, _h: i32) {}
 
-pub fn find_binkplay() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("binkplay")))
-        .filter(|p| p.exists())
-        .unwrap_or_else(|| PathBuf::from("binkplay"))
-}
-
 pub fn find_radvideo64() -> Option<PathBuf> { None }
 
 pub fn stop_wav() {
@@ -239,14 +231,19 @@ pub fn stop_wav() {
     }
 }
 }
-use plat::{active_window, dock_child_hwnd, find_binkplay, find_hwnd_for_pid, find_radvideo64, move_window, stop_wav};
+use plat::{active_window, dock_child_hwnd, find_hwnd_for_pid, move_window, stop_wav};
 
-/// Resolved Bink video player. RAD Video Tools' `radvideo64.exe` is preferred
-/// and invoked as `radvideo64.exe binkplay <clip>`; legacy `binkplay.exe` is
-/// only used when `radvideo64.exe` cannot be found.
+/// Resolved Bink video player.
+///
+/// On Windows RAD Video Tools' `radvideo64.exe` is preferred and invoked as
+/// `radvideo64.exe binkplay <clip>`, with legacy `binkplay.exe` as fallback.
+/// On Linux/macOS any locally installed player with FFmpeg Bink support is
+/// used (`mpv`, `ffplay`, `VLC`, `mplayer`); no RAD tools or `binkplay` are
+/// required. `PERCYSTAR_VIDEO_PLAYER` overrides the Unix choice.
 pub struct BinkLauncher {
     pub exe: PathBuf,
     pub via_radvideo: bool,
+    label: String,
 }
 
 impl BinkLauncher {
@@ -260,16 +257,90 @@ impl BinkLauncher {
         cmd
     }
 
-    pub fn label(&self) -> &'static str {
-        if self.via_radvideo { "RADVideo64 BinkPlay" } else { "D3D11 BinkPlay" }
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+}
+
+#[cfg(not(windows))]
+fn resolve_unix_player(name: &str) -> Option<PathBuf> {
+    let pb = PathBuf::from(name);
+    if pb.is_file() {
+        return Some(pb);
+    }
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn find_unix_video_launcher() -> BinkLauncher {
+    // Highest-quality general-purpose players first; all can decode Bink/Bink2
+    // through their bundled FFmpeg support without RAD Video Tools.
+    let players: [(&str, &str); 4] = [
+        ("mpv", "mpv"),
+        ("ffplay", "ffplay (FFmpeg)"),
+        ("vlc", "VLC"),
+        ("mplayer", "MPlayer"),
+    ];
+
+    if let Ok(override_player) = std::env::var("PERCYSTAR_VIDEO_PLAYER") {
+        let name = override_player.trim().trim_matches('"');
+        if !name.is_empty() {
+            if let Some(exe) = resolve_unix_player(name) {
+                return BinkLauncher {
+                    exe,
+                    via_radvideo: false,
+                    label: format!("{name} (PERCYSTAR_VIDEO_PLAYER)"),
+                };
+            }
+        }
+    }
+
+    for (exe_name, label) in players {
+        if let Some(exe) = resolve_unix_player(exe_name) {
+            return BinkLauncher {
+                exe,
+                via_radvideo: false,
+                label: label.to_string(),
+            };
+        }
+    }
+
+    // Keep a useful fallback so the error message tells users what to install.
+    BinkLauncher {
+        exe: PathBuf::from("ffplay"),
+        via_radvideo: false,
+        label: "ffplay (FFmpeg)".to_string(),
     }
 }
 
 pub fn find_bink_launcher() -> BinkLauncher {
-    if let Some(exe) = find_radvideo64() {
-        return BinkLauncher { exe, via_radvideo: true };
+    #[cfg(windows)]
+    {
+        if let Some(exe) = plat::find_radvideo64() {
+            return BinkLauncher {
+                exe,
+                via_radvideo: true,
+                label: "RADVideo64 BinkPlay".to_string(),
+            };
+        }
+        BinkLauncher {
+            exe: plat::find_binkplay(),
+            via_radvideo: false,
+            label: "D3D11 BinkPlay".to_string(),
+        }
     }
-    BinkLauncher { exe: find_binkplay(), via_radvideo: false }
+    #[cfg(not(windows))]
+    {
+        find_unix_video_launcher()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -548,7 +619,7 @@ enum Category {
     Binary,
 }
 
-const MODEL_TEX_TIP: &str = "Open every texture this model's materials use as flat images for inspection and export";
+const MODEL_TEX_TIP: &str = "Decode every texture this model's materials use, apply them to the 3D model, and open flat images for inspection and export";
 
 // lod switch requested from the 3d viewer header
 #[derive(Clone, Copy)]
@@ -632,6 +703,13 @@ struct ScanState {
     ver: u64,
 }
 
+// textures decoded for the model Texture Browser, with the owning entry so late jobs cannot bind to another model
+struct ModelTextureResult {
+    entry: usize,
+    textures: Vec<(u64, DecodedTexture)>,
+    note: String,
+}
+
 #[derive(Default)]
 struct MediaState {
     loading: bool,
@@ -648,7 +726,7 @@ struct MediaState {
     loaded_vehicle_configurations: Option<(u64, vehicle_variations::VehicleConfigurationDb)>,
     loaded_textures: Option<Vec<DecodedTexture>>,
     // textures bound by the viewed model with a summary note the model stays loaded behind them
-    loaded_model_textures: Option<(Vec<DecodedTexture>, String)>,
+    loaded_model_textures: Option<ModelTextureResult>,
 }
 
 #[derive(Clone)]
@@ -937,6 +1015,8 @@ struct Rpf9App {
     tex_pick: bool,
     // shown textures belong to the viewed model so the viewer offers a way back to it
     tex_from_model: bool,
+    // 64-bit hashes parallel to `textures` when they came from the model Texture Browser
+    model_tex_hashes: Vec<u64>,
     // camera yaw pitch zoom pan carried across a lod switch
     lod_keep_cam: Option<[f32; 5]>,
     export_busy: Arc<AtomicBool>,
@@ -1118,6 +1198,7 @@ impl Rpf9App {
             vehicle_data: Arc::default(),
             tex_pick: false,
             tex_from_model: false,
+            model_tex_hashes: Vec::new(),
             lod_keep_cam: None,
             export_busy: Arc::new(AtomicBool::new(false)),
             psin_selected: false,
@@ -1233,6 +1314,7 @@ impl Rpf9App {
         self.vehicle_variation_filter.clear();
         self.tex_pick = false;
         self.tex_from_model = false;
+        self.model_tex_hashes.clear();
         self.lod_keep_cam = None;
         self.psin_selected = false;
         self.psin_tree = None;
@@ -2128,10 +2210,14 @@ impl Rpf9App {
         }
         let t = &self.textures[self.tex_sel];
         let mut back = false;
+        let mut apply_model = false;
         let mut export_all = false;
         ui.horizontal(|ui| {
             if self.tex_from_model && ui.button("◀ Back to model").clicked() {
                 back = true;
+            }
+            if self.tex_from_model && ui.button("✓ Apply to 3D model").on_hover_text("Bind every discovered texture to the current model and return to the 3D viewer").clicked() {
+                apply_model = true;
             }
             ui.label(RichText::new(&t.name).strong().color(Color32::from_rgb(255, 168, 28)));
             ui.label(RichText::new(format!("{}x{} · {} · mips={}", t.w, t.h, t.fmt_name, t.mips)).color(Color32::from_rgb(170, 210, 235)));
@@ -2175,9 +2261,23 @@ impl Rpf9App {
         }
         if back {
             self.textures.clear();
+            self.model_tex_hashes.clear();
             self.tex_handle = None;
             self.tex_from_model = false;
             self.show_3d = true;
+            return;
+        }
+        if apply_model {
+            let pairs: Vec<(u64, DecodedTexture)> = self.textures.iter().zip(self.model_tex_hashes.iter().copied())
+                .map(|(tex, hash)| (hash, tex.clone()))
+                .collect();
+            let applied = self.mesh3d.as_mut().map(|mesh| mesh.apply_browser_textures(&pairs)).unwrap_or(0);
+            self.textures.clear();
+            self.model_tex_hashes.clear();
+            self.tex_handle = None;
+            self.tex_from_model = false;
+            self.show_3d = true;
+            self.state.lock().unwrap().status = format!("Applied {applied} textures to the model");
             return;
         }
         if self.textures.len() > 1 {
@@ -2242,7 +2342,8 @@ impl Rpf9App {
 
     // lists and decodes every pooled texture the selected model binds in its shaders
     fn load_model_textures(&mut self) {
-        let Some(e) = self.model_entry.and_then(|i| self.state.lock().unwrap().entries.get(i).cloned()) else { return };
+        let Some(entry) = self.model_entry else { return };
+        let Some(e) = self.state.lock().unwrap().entries.get(entry).cloned() else { return };
         let name = e.name.clone();
         spawn_media_job(
             &self.media,
@@ -2259,7 +2360,7 @@ impl Rpf9App {
                     if let Ok(mut t) = decode_ttpf_texture(&hit.path, hit.tex_idx) {
                         let pool = hit.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                         t.name = format!("{} · {pool} #{}", r.role(), hit.tex_idx);
-                        texs.push(t);
+                        texs.push((r.hash64, t));
                     }
                 }
                 if texs.is_empty() {
@@ -2271,7 +2372,7 @@ impl Rpf9App {
                     texs.len(),
                     total - pooled.len()
                 );
-                Ok((texs, note))
+                Ok(ModelTextureResult { entry, textures: texs, note })
             },
             move |m, res| match res {
                 Ok(v) => {
@@ -2404,9 +2505,14 @@ impl Rpf9App {
                     m.status = format!("Playing {} ({})", e.name, launcher.label());
                 }
                 Err(err) => {
+                    #[cfg(windows)]
+                    let hint = "install RAD Video Tools (radvideo64.exe), place binkplay.exe next to PercyStar.exe, add RADVideo to PATH, or set RADVIDEO64_PATH / BINKPLAY_PATH";
+                    #[cfg(not(windows))]
+                    let hint = "install mpv or ffmpeg (ffplay) and ensure it is on PATH, or set PERCYSTAR_VIDEO_PLAYER to a Bink-capable player";
                     self.media.lock().unwrap().status = format!(
-                        "bink player error ({}): {err} — install RAD Video Tools (radvideo64.exe), place binkplay.exe next to PercyStar.exe, add RADVideo to PATH, or set RADVIDEO64_PATH / BINKPLAY_PATH",
-                        launcher.exe.display()
+                        "video player error ({}) [{}]: {err} — {hint}",
+                        launcher.exe.display(),
+                        launcher.label()
                     );
                 }
             }
@@ -5235,18 +5341,30 @@ impl eframe::App for Rpf9App {
             if had_loaded_parts {
                 self.rebuild_vehicle_parts();
             }
-            if let Some((texs, note)) = m.loaded_model_textures.take() {
-                self.textures = texs;
+            if let Some(result) = m.loaded_model_textures.take() {
+                let applied = if result.entry == self.model_entry {
+                    self.mesh3d.as_mut().map(|mesh| mesh.apply_browser_textures(&result.textures)).unwrap_or(0)
+                } else {
+                    0
+                };
+                self.model_tex_hashes = result.textures.iter().map(|(hash, _)| *hash).collect();
+                self.textures = result.textures.into_iter().map(|(_, tex)| tex).collect();
                 self.tex_sel = 0;
                 self.tex_handle = None;
                 self.tex_zoom = 1.0;
                 self.tex_from_model = true;
+                let note = if applied > 0 {
+                    format!("{} — applied {applied} textures to the model", result.note)
+                } else {
+                    result.note
+                };
                 self.state.lock().unwrap().status = note;
             }
             if let Some(texs) = m.loaded_textures.take() {
                 self.mesh3d = None;
                 self.show_3d = false;
                 self.tex_from_model = false;
+                self.model_tex_hashes.clear();
                 self.textures = texs;
                 self.tex_sel = 0;
                 self.tex_handle = None;
@@ -6396,6 +6514,16 @@ fn main() -> eframe::Result<()> {
             Ok(data) => match psin::parse_psin_doc(&data) {
                 Ok(doc) => print!("{}", doc.export_placements_csv(None, tsv)),
                 Err(e) => eprintln!("PSIN error: {e}"),
+            },
+            Err(e) => eprintln!("Read error: {e}"),
+        }
+        return Ok(());
+    }
+    if args.len() >= 3 && args[1] == "--inspect-bk2" {
+        match fs::read(&args[2]) {
+            Ok(data) => match bink2_container::BinkContainer::parse(&data) {
+                Ok(container) => print!("{}", container.format_report()),
+                Err(e) => eprintln!("BK2 inspect error: {e}"),
             },
             Err(e) => eprintln!("Read error: {e}"),
         }

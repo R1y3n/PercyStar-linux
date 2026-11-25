@@ -622,7 +622,7 @@
       "status": "Cataloged",
       "what": "276 standalone Bink2 (KB2) streams (7.25 GB, up to 2560\u00d71440; 558 total KB2 videos across build).",
       "enc": "Unencrypted raw KB2* containers; only outer RPF9 filenames are hidden by TOC.",
-      "how": "Directly playable via RAD Bink2 (binkplay) or standard Bink2 decoders."
+      "how": "Linux: playable without binkplay using local mpv/ffplay/VLC/MPlayer (FFmpeg Bink2 decode) plus PercyStar --inspect-bk2; Windows: RAD Bink2 (binkplay) or standard Bink2 decoders."
     },
     {
       "name": "textures.rpf",

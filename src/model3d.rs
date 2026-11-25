@@ -258,6 +258,73 @@ impl Mesh3D {
         self.apply_tex_layers();
     }
 
+    // binds textures decoded by the model Texture Browser into the layer/material
+    // system used by the rasterizer. Existing shader-bound layers are overridden by
+    // hash; browser-only hashes become low-priority color layers on visible materials.
+    pub fn apply_browser_textures(&mut self, textures: &[(u64, crate::tex::DecodedTexture)]) -> usize {
+        if textures.is_empty() {
+            return 0;
+        }
+        let mut by_hash: HashMap<u64, Arc<Texture2D>> = HashMap::with_capacity(textures.len());
+        for (hash, decoded) in textures {
+            by_hash.insert(*hash, Arc::new(crate::tex::to_model_tex(decoded.clone())));
+        }
+        let applied = by_hash.len();
+        let mut matched = HashSet::new();
+        for layer in &mut self.tex_layers {
+            if let Some(tex) = by_hash.get(&layer.hash64) {
+                layer.tex = Some(tex.clone());
+                layer.failed = false;
+                layer.enabled = true;
+                layer.w = tex.w;
+                layer.h = tex.h;
+                matched.insert(layer.hash64);
+            }
+        }
+
+        let mut unmatched: Vec<_> = by_hash.iter().filter(|(hash, _)| !matched.contains(*hash)).collect();
+        unmatched.sort_by_key(|(hash, _)| **hash);
+        let mut added = Vec::new();
+        for (hash, tex) in unmatched {
+            let Ok(idx) = u16::try_from(self.tex_layers.len()) else { break };
+            self.tex_layers.push(TexLayer {
+                hash64: *hash,
+                label: format!("browser {:016x}", *hash),
+                kind: TexLayerKind::Color,
+                w: tex.w,
+                h: tex.h,
+                source: "Texture Browser".to_string(),
+                mats: 0,
+                enabled: true,
+                default_on: true,
+                hit: crate::tex::TtpfHashHit {
+                    path: std::path::PathBuf::from("Texture Browser"),
+                    tex_idx: 0,
+                    w: tex.w,
+                    h: tex.h,
+                    dxgi: 29,
+                },
+                tex: Some(tex.clone()),
+                failed: false,
+            });
+            added.push(idx);
+        }
+        if !added.is_empty() {
+            for mat in &mut self.geom_materials {
+                if mat.auxiliary_pass { continue; }
+                for idx in &added {
+                    if !mat.color_layers.contains(idx) {
+                        mat.color_layers.push(*idx);
+                    }
+                }
+            }
+        }
+
+        self.apply_tex_layers();
+        self.tex_status = format!("Texture Browser: {applied} textures applied");
+        applied
+    }
+
     fn refresh_tex_status(&mut self) {
         if self.geom_materials.is_empty() {
             return;

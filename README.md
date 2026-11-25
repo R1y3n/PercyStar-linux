@@ -21,7 +21,7 @@ Download from the [Releases page](https://github.com/R1y3n/PercyStar-linux/relea
 - AppImage packaging (`linuxdeploy` + `appimagetool`) for easier distribution.
 - GTK3 file dialog backend on Linux (`rfd`).
 - Offline mode: startup update check and in-app update UI disabled.
-- Linux-native Bink video playback: extracts Bink frames in-process instead of shelling out to Windows-only `binkplay.exe`.
+- Linux video playback without `binkplay.exe`/RAD Video Tools: uses a locally installed `mpv`, `ffplay`, VLC or MPlayer (override with `PERCYSTAR_VIDEO_PLAYER`), plus a native `--inspect-bk2` container report.
 - 3D model viewer applies discovered TXD/TTPF textures to the rasterizer instead of leaving models untextured.
 - RPF scan improvements: skip already-identified zlib offsets in the second pass and lower idle model-viewer RAM.
 - Scan regression fix so second-pass entries (XML/RBF0/GXT/PSIN/DAT/ZLIB/bin, etc.) are found again for <=512MB archives.
@@ -39,6 +39,17 @@ Download from the [Releases page](https://github.com/R1y3n/PercyStar-linux/relea
 - Bundles app dependencies through linuxdeploy/appimagetool; GPU drivers still come from the host.
 - If FUSE is not available, run with `--appimage-extract-and-run`.
 - Sets `GIO_MODULE_DIR` inside the AppImage to avoid host GIO module symbol mismatches.
+
+## Video playback on Linux
+
+PercyStar no longer requires Windows-only `binkplay.exe` or RAD Video Tools. Selecting a `.bk2` clip writes a temporary file and opens it with the first available local player (all decode Bink/Bink2 through FFmpeg):
+
+1. `mpv`
+2. `ffplay` (from `ffmpeg`)
+3. VLC
+4. MPlayer
+
+Install one of them, for example `sudo apt-get install mpv` or `sudo apt-get install ffmpeg`. To force a specific player, set `PERCYSTAR_VIDEO_PLAYER=/path/to/player`. Playback is fully local/offline; PercyStar makes no network requests. `--inspect-bk2 <file.bk2>` prints a native container report without any external tool.
 
 ## CLI scan
 
