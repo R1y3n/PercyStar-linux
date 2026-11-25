@@ -312,14 +312,20 @@ impl Mesh3D {
         if !added.is_empty() {
             for mat in &mut self.geom_materials {
                 if mat.auxiliary_pass { continue; }
-                for idx in &added {
+                // Highest priority first: an earlier enabled but undecodable layer
+                // would otherwise hide every browser-applied texture.
+                for idx in added.iter().rev() {
                     if !mat.color_layers.contains(idx) {
-                        mat.color_layers.push(*idx);
+                        mat.color_layers.insert(0, *idx);
                     }
                 }
             }
         }
 
+        // An embedded or manually loaded whole-mesh texture shadows every material
+        // texture in the rasterizer. Explicit browser application replaces it.
+        self.texture = None;
+        self.tex_status.clear();
         self.apply_tex_layers();
         self.tex_status = format!("Texture Browser: {applied} textures applied");
         applied
